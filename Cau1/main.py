@@ -1,7 +1,9 @@
 import os
 import argparse
-import subprocess
+import json
 import shutil
+import urllib.request
+import zipfile
 from pathlib import Path
 
 # Cần cài đặt trước: pip install transformers datasets seqeval scikit-learn rich pytorch-crf
@@ -12,77 +14,131 @@ from data_loader import load_all_datasets, build_task_dataloader, get_class_weig
 from model import MultiTaskPhoBERT
 from trainer import Trainer
 
+
+def _dir_ready(path: str) -> bool:
+    """Kiểm tra thư mục đã có dữ liệu chưa."""
+    return os.path.isdir(path) and len(os.listdir(path)) > 0
+
+
 def download_data(data_dir: str):
     """
-    Tự động tải dữ liệu từ các repository GitHub và sắp xếp vào đúng thư mục.
+    Tự động tải dữ liệu từ HuggingFace Hub và GitHub ZIP.
+    Không sử dụng git clone (tránh lỗi auth trên Colab).
+
+    Nguồn dữ liệu:
+      1. UIT-VSFC (Sentiment)  → HuggingFace: uitnlp/vietnamese_students_feedback
+      2. UIT-ViSFD (ABSA)      → GitHub ZIP:  LuongPhan/UIT-ViSFD
+      3. WikiANN-vi (NER)      → HuggingFace: wikiann (lang=vi)
     """
+    from datasets import load_dataset
+
     os.makedirs(data_dir, exist_ok=True)
-    
-    # 1. UIT-VSFC
+
+    # ─── 1. UIT-VSFC (Sentiment) ─────────────────────────────────────────
     vsfc_dir = os.path.join(data_dir, "UIT-VSFC")
-    if not os.path.exists(vsfc_dir) or not os.listdir(vsfc_dir):
-        print("[Download] Đang tải dataset UIT-VSFC...")
-        subprocess.run(["git", "clone", "https://huggingface.co/datasets/uitnlp/vietnamese_students_feedback", "tmp_vsfc"], check=False)
-        os.makedirs(vsfc_dir, exist_ok=True)
-        # Tìm các file txt (train, dev, test)
-        for root, _, files in os.walk("tmp_vsfc"):
-            for file in files:
-                if file.endswith(".txt") and file.lower() in ["train.txt", "dev.txt", "test.txt", "val.txt"]:
-                    shutil.copy(os.path.join(root, file), os.path.join(vsfc_dir, file.lower()))
-        
-        # Đổi tên val.txt thành dev.txt nếu cần
-        if os.path.exists(os.path.join(vsfc_dir, "val.txt")) and not os.path.exists(os.path.join(vsfc_dir, "dev.txt")):
-            os.rename(os.path.join(vsfc_dir, "val.txt"), os.path.join(vsfc_dir, "dev.txt"))
-        
-        shutil.rmtree("tmp_vsfc", ignore_errors=True)
+    if not _dir_ready(vsfc_dir):
+        print("[Download] Đang tải UIT-VSFC từ HuggingFace Hub...")
+        try:
+            ds = load_dataset("uitnlp/vietnamese_students_feedback", trust_remote_code=True)
+            os.makedirs(vsfc_dir, exist_ok=True)
+
+            split_map = {"train": "train.txt", "validation": "dev.txt", "test": "test.txt"}
+            for split_name, fname in split_map.items():
+                if split_name not in ds:
+                    continue
+                fpath = os.path.join(vsfc_dir, fname)
+                count = 0
+                with open(fpath, "w", encoding="utf-8") as f:
+                    for row in ds[split_name]:
+                        text = row.get("sentence", row.get("text", "")).strip()
+                        label = row.get("sentiment", row.get("label", 0))
+                        if text:
+                            f.write(f"{text}\t{label}\n")
+                            count += 1
+                print(f"  ✅ {fname}: {count} mẫu")
+        except Exception as e:
+            print(f"  ❌ Lỗi tải UIT-VSFC: {e}")
     else:
         print("[Download] UIT-VSFC đã tồn tại.")
 
-    # 2. UIT-ViSFD
+    # ─── 2. UIT-ViSFD (ABSA) — tải ZIP từ GitHub ─────────────────────────
     visfd_dir = os.path.join(data_dir, "UIT-ViSFD")
-    if not os.path.exists(visfd_dir) or not os.listdir(visfd_dir):
-        print("[Download] Đang tải dataset UIT-ViSFD...")
-        subprocess.run(["git", "clone", "https://github.com/LuongPhan/UIT-ViSFD.git", "tmp_visfd"], check=False)
-        os.makedirs(visfd_dir, exist_ok=True)
-        # Tìm các file json (train, dev, test)
-        for root, _, files in os.walk("tmp_visfd"):
-            for file in files:
-                if file.endswith(".json") and file.lower() in ["train.json", "dev.json", "test.json", "val.json"]:
-                    shutil.copy(os.path.join(root, file), os.path.join(visfd_dir, file.lower()))
-                    
-        # Đổi tên val.json thành dev.json nếu cần
-        if os.path.exists(os.path.join(visfd_dir, "val.json")) and not os.path.exists(os.path.join(visfd_dir, "dev.json")):
-            os.rename(os.path.join(visfd_dir, "val.json"), os.path.join(visfd_dir, "dev.json"))
-            
-        shutil.rmtree("tmp_visfd", ignore_errors=True)
+    if not _dir_ready(visfd_dir):
+        print("[Download] Đang tải UIT-ViSFD từ GitHub (ZIP)...")
+        zip_url = "https://github.com/LuongPhan/UIT-ViSFD/archive/refs/heads/main.zip"
+        zip_path = os.path.join(data_dir, "_visfd_tmp.zip")
+        tmp_extract = os.path.join(data_dir, "_visfd_tmp")
+        try:
+            urllib.request.urlretrieve(zip_url, zip_path)
+            with zipfile.ZipFile(zip_path, "r") as z:
+                z.extractall(tmp_extract)
+            os.makedirs(visfd_dir, exist_ok=True)
+
+            # Tìm file JSON trong thư mục giải nén
+            for root, _, files in os.walk(tmp_extract):
+                for file in files:
+                    low = file.lower()
+                    if low.endswith(".json") and low in [
+                        "train.json", "dev.json", "test.json", "val.json",
+                    ]:
+                        shutil.copy(os.path.join(root, file),
+                                    os.path.join(visfd_dir, low))
+
+            # val.json → dev.json nếu cần
+            val_j = os.path.join(visfd_dir, "val.json")
+            dev_j = os.path.join(visfd_dir, "dev.json")
+            if os.path.exists(val_j) and not os.path.exists(dev_j):
+                os.rename(val_j, dev_j)
+
+            found = [f for f in os.listdir(visfd_dir) if f.endswith(".json")]
+            if found:
+                print(f"  ✅ UIT-ViSFD: {found}")
+            else:
+                print("  ⚠️ Không tìm thấy file JSON trong repo ZIP.")
+        except Exception as e:
+            print(f"  ❌ Lỗi tải UIT-ViSFD: {e}")
+        finally:
+            if os.path.exists(zip_path):
+                os.remove(zip_path)
+            shutil.rmtree(tmp_extract, ignore_errors=True)
     else:
         print("[Download] UIT-ViSFD đã tồn tại.")
 
-    # 3. VLSP-NER 2016
+    # ─── 3. WikiANN-vi (NER) — thay thế VLSP-NER ─────────────────────────
     vlsp_dir = os.path.join(data_dir, "VLSP-NER")
-    if not os.path.exists(vlsp_dir) or not os.listdir(vlsp_dir):
-        print("[Download] Đang tải dataset VLSP-NER (bản copy public)...")
-        # Sử dụng một bản copy public phổ biến vì VLSP yêu cầu đăng ký
-        subprocess.run(["git", "clone", "https://github.com/NganDong/VLSP2016-NER.git", "tmp_vlsp"], check=False)
-        os.makedirs(vlsp_dir, exist_ok=True)
-        
-        for root, _, files in os.walk("tmp_vlsp"):
-            for file in files:
-                if file.lower() in ["train.txt", "dev.txt", "test.txt", "val.txt"]:
-                    shutil.copy(os.path.join(root, file), os.path.join(vlsp_dir, file.lower()))
-        
-        if os.path.exists(os.path.join(vlsp_dir, "val.txt")) and not os.path.exists(os.path.join(vlsp_dir, "dev.txt")):
-            os.rename(os.path.join(vlsp_dir, "val.txt"), os.path.join(vlsp_dir, "dev.txt"))
-            
-        shutil.rmtree("tmp_vlsp", ignore_errors=True)
-        
-        # Cảnh báo nếu không tìm thấy dữ liệu (do repo trên có thể bị lỗi)
-        if not os.listdir(vlsp_dir):
-            print("⚠️ CẢNH BÁO: Không thể tự động tải VLSP-NER. Bạn hãy tải thủ công từ https://vlsp.org.vn/resources và đặt vào data/VLSP-NER/")
+    if not _dir_ready(vlsp_dir):
+        print("[Download] Đang tải WikiANN-vi (NER) từ HuggingFace Hub...")
+        try:
+            ds = load_dataset("wikiann", "vi", trust_remote_code=True)
+            os.makedirs(vlsp_dir, exist_ok=True)
+
+            # WikiANN tag mapping: 0=O, 1=B-PER, 2=I-PER, 3=B-ORG, 4=I-ORG, 5=B-LOC, 6=I-LOC
+            WIKIANN_TAGS = [
+                "O", "B-PER", "I-PER", "B-ORG", "I-ORG", "B-LOC", "I-LOC",
+            ]
+
+            split_map = {"train": "train.txt", "validation": "dev.txt", "test": "test.txt"}
+            for split_name, fname in split_map.items():
+                if split_name not in ds:
+                    continue
+                fpath = os.path.join(vlsp_dir, fname)
+                count = 0
+                with open(fpath, "w", encoding="utf-8") as f:
+                    for row in ds[split_name]:
+                        tokens = row["tokens"]
+                        ner_tags = row["ner_tags"]
+                        for tok, tag_id in zip(tokens, ner_tags):
+                            tag = WIKIANN_TAGS[tag_id] if tag_id < len(WIKIANN_TAGS) else "O"
+                            f.write(f"{tok} {tag}\n")
+                        f.write("\n")
+                        count += 1
+                print(f"  ✅ {fname}: {count} câu")
+        except Exception as e:
+            print(f"  ❌ Lỗi tải WikiANN-vi: {e}")
     else:
-        print("[Download] VLSP-NER đã tồn tại.")
-        
-    print("[Download] Hoàn tất quá trình chuẩn bị dữ liệu!")
+        print("[Download] VLSP-NER (WikiANN-vi) đã tồn tại.")
+
+    print("[Download] ✅ Hoàn tất quá trình chuẩn bị dữ liệu!")
 
 def main():
     parser = argparse.ArgumentParser(description="MultiTaskPhoBERT Main Training Pipeline")
