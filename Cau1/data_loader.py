@@ -14,8 +14,11 @@ Author : NLP Pipeline
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 import os
+import re
 from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
@@ -43,7 +46,11 @@ NER_LABEL_LIST: List[str] = [
 NER_LABEL2ID: Dict[str, int] = {tag: idx for idx, tag in enumerate(NER_LABEL_LIST)}
 NER_ID2LABEL: Dict[int, str] = {idx: tag for tag, idx in NER_LABEL2ID.items()}
 
-ABSA_ASPECTS: List[str] = ["FOOD", "SERVICE", "PRICE", "AMBIENCE"]
+ABSA_ASPECTS: List[str] = [
+    "SCREEN", "CAMERA", "FEATURES", "BATTERY",
+    "PERFORMANCE", "STORAGE", "DESIGN", "PRICE",
+    "GENERAL", "SER&ACC",
+]
 ABSA_POLARITIES: Dict[str, int] = {"negative": 0, "neutral": 1, "positive": 2}
 
 SENTIMENT_LABELS: int = 3
@@ -71,31 +78,64 @@ def _require_path(path: str | Path, url: str) -> Path:
 
 def _read_vsfc(root: str | Path) -> Dict[str, List[Dict[str, Any]]]:
     """
-    Read UIT-VSFC TSV files.
+    Read UIT-VSFC dataset.
 
-    Expected structure:
-        root/
-            train.txt   (sentence\\tlabel)
-            dev.txt
-            test.txt
+    Supports TWO formats:
+      A) Subfolder format (original dataset):
+            root/train/sents.txt  +  root/train/sentiments.txt
+            root/dev/...          (or root/test/...)
+      B) TSV format (preprocessed):
+            root/train.txt   (sentence\\tlabel)
     """
     root = _require_path(root, VSFC_URL)
     splits: Dict[str, List[Dict[str, Any]]] = {}
-    mapping = {"train": "train.txt", "val": "dev.txt", "test": "test.txt"}
+    # Map split names to (subfolder_name, tsv_file) pairs
+    mapping = {
+        "train": ("train", "train.txt"),
+        "val":   ("dev",   "dev.txt"),
+        "test":  ("test",  "test.txt"),
+    }
 
-    for split_name, fname in mapping.items():
-        fpath = root / fname
-        if not fpath.exists():
-            # Also accept alternative names
+    for split_name, (subfolder, tsv_fname) in mapping.items():
+        records: List[Dict[str, Any]] = []
+
+        # ── Format A: subfolder with sents.txt + sentiments.txt ──
+        sents_path = root / subfolder / "sents.txt"
+        labels_path = root / subfolder / "sentiments.txt"
+        if sents_path.exists() and labels_path.exists():
+            with open(sents_path, "r", encoding="utf-8") as fs, \
+                 open(labels_path, "r", encoding="utf-8") as fl:
+                for text_line, label_line in zip(fs, fl):
+                    text = text_line.strip()
+                    label_str = label_line.strip()
+                    if not text or not label_str:
+                        continue
+                    try:
+                        label = int(label_str)
+                    except ValueError:
+                        continue
+                    records.append({
+                        "text": text,
+                        "task": "sentiment",
+                        "sentiment_label": label,
+                        "aspect_labels": None,
+                        "ner_tags": None,
+                    })
+            splits[split_name] = records
+            continue
+
+        # ── Format B: single TSV file ──
+        tsv_path = root / tsv_fname
+        if not tsv_path.exists():
             alt = root / f"{split_name}.txt"
             if alt.exists():
-                fpath = alt
+                tsv_path = alt
             else:
                 raise FileNotFoundError(
-                    f"Missing {fpath} for UIT-VSFC. Download: {VSFC_URL}"
+                    f"Missing {sents_path} (subfolder) or {tsv_path} (TSV) "
+                    f"for UIT-VSFC. Download: {VSFC_URL}"
                 )
-        records: List[Dict[str, Any]] = []
-        with open(fpath, "r", encoding="utf-8") as f:
+        with open(tsv_path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -119,58 +159,115 @@ def _read_vsfc(root: str | Path) -> Dict[str, List[Dict[str, Any]]]:
     return splits
 
 
+# Regex to parse aspect labels like {CAMERA#Positive};{BATTERY#Negative};
+_ASPECT_RE = re.compile(r"\{([^#}]+)#(\w+)\}")
+
+
+def _parse_visfd_label(label_str: str) -> Dict[str, int]:
+    """
+    Parse ViSFD label string ``{ASPECT#Polarity};...`` into a dict.
+
+    Aspects not mentioned in the label string are set to neutral (1).
+    The special aspect ``OTHERS`` is ignored.
+    """
+    aspect_dict: Dict[str, int] = {a: ABSA_POLARITIES["neutral"] for a in ABSA_ASPECTS}
+    for match in _ASPECT_RE.finditer(label_str):
+        aspect_name = match.group(1).strip()
+        polarity = match.group(2).strip().lower()
+        if aspect_name == "OTHERS":
+            continue
+        pol_id = ABSA_POLARITIES.get(polarity, ABSA_POLARITIES["neutral"])
+        if aspect_name in aspect_dict:
+            aspect_dict[aspect_name] = pol_id
+    return aspect_dict
+
+
 def _read_visfd(root: str | Path) -> Dict[str, List[Dict[str, Any]]]:
     """
-    Read UIT-ViSFD JSON files.
+    Read UIT-ViSFD dataset.
 
-    Expected structure:
-        root/
-            train.json
-            dev.json
-            test.json
-
-    Each JSON record must contain at least:
-        {"text": "...", "aspects": {"FOOD": "positive", ...}}
+    Supports TWO formats:
+      A) CSV format (original dataset):
+            root/Train.csv  (columns: index, comment, n_star, date_time, label)
+            label format: {CAMERA#Positive};{BATTERY#Negative};...
+      B) JSON format (preprocessed):
+            root/train.json  [{"text": ..., "aspects": {...}}]
     """
     root = _require_path(root, VISFD_URL)
     splits: Dict[str, List[Dict[str, Any]]] = {}
-    mapping = {"train": "train.json", "val": "dev.json", "test": "test.json"}
+    mapping = {
+        "train": (["Train.csv", "train.csv"], ["train.json"]),
+        "val":   (["Dev.csv",   "dev.csv"],   ["dev.json", "val.json"]),
+        "test":  (["Test.csv",  "test.csv"],  ["test.json"]),
+    }
 
-    for split_name, fname in mapping.items():
-        fpath = root / fname
-        if not fpath.exists():
-            alt = root / f"{split_name}.json"
-            if alt.exists():
-                fpath = alt
-            else:
-                raise FileNotFoundError(
-                    f"Missing {fpath} for UIT-ViSFD. Download: {VISFD_URL}"
-                )
+    for split_name, (csv_names, json_names) in mapping.items():
+        records: List[Dict[str, Any]] = []
 
-        with open(fpath, "r", encoding="utf-8") as f:
+        # ── Format A: CSV ──
+        csv_path: Optional[Path] = None
+        for name in csv_names:
+            candidate = root / name
+            if candidate.exists():
+                csv_path = candidate
+                break
+
+        if csv_path is not None:
+            with open(csv_path, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    text = (row.get("comment") or row.get("text") or "").strip()
+                    if not text:
+                        continue
+                    label_str = row.get("label", "")
+                    aspect_dict = _parse_visfd_label(label_str)
+                    records.append({
+                        "text": text,
+                        "task": "absa",
+                        "sentiment_label": None,
+                        "aspect_labels": aspect_dict,
+                        "ner_tags": None,
+                    })
+            splits[split_name] = records
+            continue
+
+        # ── Format B: JSON (fallback) ──
+        json_path: Optional[Path] = None
+        for name in json_names:
+            candidate = root / name
+            if candidate.exists():
+                json_path = candidate
+                break
+
+        if json_path is None:
+            raise FileNotFoundError(
+                f"Missing CSV or JSON files for UIT-ViSFD in {root}. "
+                f"Download: {VISFD_URL}"
+            )
+
+        with open(json_path, "r", encoding="utf-8") as f:
             raw = json.load(f)
 
-        records: List[Dict[str, Any]] = []
         items = raw if isinstance(raw, list) else raw.get("data", raw.values())
         for item in items:
             text = item.get("text", item.get("sentence", "")).strip()
             if not text:
                 continue
             aspects_raw = item.get("aspects", item.get("labels", {}))
-            aspect_dict: Dict[str, int] = {}
+            aspect_dict_j: Dict[str, int] = {}
             for asp in ABSA_ASPECTS:
                 pol_str = aspects_raw.get(asp, aspects_raw.get(asp.lower(), "neutral"))
                 if isinstance(pol_str, int):
-                    aspect_dict[asp] = pol_str
+                    aspect_dict_j[asp] = pol_str
                 else:
-                    aspect_dict[asp] = ABSA_POLARITIES.get(
+                    aspect_dict_j[asp] = ABSA_POLARITIES.get(
                         pol_str.lower().strip(), ABSA_POLARITIES["neutral"]
                     )
             records.append({
                 "text": text,
                 "task": "absa",
                 "sentiment_label": None,
-                "aspect_labels": aspect_dict,
+                "aspect_labels": aspect_dict_j,
                 "ner_tags": None,
             })
         splits[split_name] = records

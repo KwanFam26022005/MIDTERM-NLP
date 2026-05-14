@@ -57,10 +57,9 @@ def _resolve_model_name() -> str:
 
 NER_NUM_LABELS: int = 9  # O, B/I-PER, B/I-ORG, B/I-LOC, B/I-MISC
 SENTIMENT_NUM_LABELS: int = 3
-ABSA_NUM_LABELS: int = 6  # 4 aspects encoded as a flat 6-dim vector is wrong
-# ↑ We actually output per-aspect predictions.  The head outputs [B, 4, 3]
-# reshaped from a Linear(hidden→12).  We keep the constant for clarity.
-ABSA_NUM_ASPECTS: int = 4
+ABSA_NUM_LABELS: int = 30  # 10 aspects × 3 polarities
+# The head outputs [B, 10, 3] reshaped from a Linear(hidden→30).
+ABSA_NUM_ASPECTS: int = 10
 ABSA_NUM_POLARITIES: int = 3
 
 

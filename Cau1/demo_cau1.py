@@ -296,11 +296,11 @@ def run_inference(text: str, task: str) -> str:
 # Gradio UI
 # ---------------------------------------------------------------------------
 EXAMPLES = [
-    ["Hôm nay tôi đi ăn ở nhà hàng Phở Thìn tại Hà Nội, rất ngon!", "Sentiment Analysis"],
+    ["Hôm nay tôi mua điện thoại iPhone 15 tại Thế Giới Di Động ở Hà Nội, xài rất mượt!", "Sentiment Analysis"],
     ["Nguyễn Văn A làm việc tại công ty FPT ở Đà Nẵng", "NER (Named Entity Recognition)"],
-    ["Quán ăn này đồ ăn ngon nhưng phục vụ chậm, giá hơi cao", "ABSA (Aspect-Based Sentiment)"],
+    ["Điện thoại này màn hình đẹp nhưng pin yếu, giá hơi cao", "ABSA (Aspect-Based Sentiment)"],
     ["Việt Nam vô địch AFF Cup tại sân Mỹ Đình", "NER (Named Entity Recognition)"],
-    ["Dịch vụ tệ, không gian chật chội nhưng món ăn khá ổn", "ABSA (Aspect-Based Sentiment)"],
+    ["Máy hay bị giật lag, thiết kế xấu nhưng camera chụp khá ổn", "ABSA (Aspect-Based Sentiment)"],
 ]
 
 CSS = """
@@ -334,7 +334,7 @@ demo = gr.Interface(
         "**Multi-Task NLP Pipeline cho Tiếng Việt** sử dụng PhoBERT backbone.\n\n"
         "- **NER**: Nhận diện thực thể (PER, ORG, LOC, MISC)\n"
         "- **Sentiment**: Phân tích cảm xúc (Positive / Neutral / Negative)\n"
-        "- **ABSA**: Phân tích cảm xúc theo khía cạnh (FOOD, SERVICE, PRICE, AMBIENCE)"
+        "- **ABSA**: Phân tích cảm xúc theo khía cạnh (SCREEN, CAMERA, BATTERY, PRICE, PERFORMANCE...)"
     ),
     examples=EXAMPLES,
     css=CSS,
