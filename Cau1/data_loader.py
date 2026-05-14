@@ -62,12 +62,12 @@ PAD_LABEL_ID: int = -100
 # Helper: check path or raise with download URL
 # ---------------------------------------------------------------------------
 
-def _require_path(path: str | Path, url: str) -> Path:
+def _require_path(path: str | Path, url_or_name: str) -> Path:
     """Return *path* as a resolved ``Path`` if it exists, otherwise raise."""
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(
-            f"Dataset path not found: {p}. Download: {url}"
+            f"Không tìm thấy thư mục dữ liệu tại: {p}. Vui lòng kiểm tra lại đường dẫn."
         )
     return p
 
