@@ -685,13 +685,13 @@ if __name__ == "__main__":
         help="Path to a saved model checkpoint (.pt file).",
     )
     parser.add_argument(
-        "--data",
+        "--data_dir",
         type=str,
-        required=True,
+        default="data",
         help=(
             "Root data directory containing sub-dirs: "
             "UIT-VSFC/, UIT-ViSFD/, VLSP-NER/"
         ),
     )
     args = parser.parse_args()
-    main(args.ckpt, args.data)
+    main(args.ckpt, args.data_dir)

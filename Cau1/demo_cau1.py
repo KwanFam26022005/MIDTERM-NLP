@@ -36,8 +36,9 @@ from model import MultiTaskPhoBERT
 # ---------------------------------------------------------------------------
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 MODEL_NAME = "vinai/phobert-base"
-CHECKPOINT_DIR = Path("checkpoints")
-
+BASE_DIR = Path(__file__).resolve().parent
+CHECKPOINT_DIR = BASE_DIR / "checkpoints"
+# CHECKPOINT_DIR = Path("checkpoints")
 _model: Optional[MultiTaskPhoBERT] = None
 _tokenizer = None
 
