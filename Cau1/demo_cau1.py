@@ -146,7 +146,7 @@ def predict_ner(text: str) -> str:
                 f'{word} <sup style="font-size:10px;">{tag}</sup></span>'
             )
         else:
-            html_parts.append(f'<span style="margin:1px; display:inline-block;">{word}</span>')
+            html_parts.append(f'<span style="margin:1px; display:inline-block; color:#eee;">{word}</span>')
 
     # Build legend
     legend = " | ".join(
@@ -194,13 +194,13 @@ def predict_sentiment(text: str) -> str:
         bar_color = "#ff6b6b" if i == 0 else "#f7dc6f" if i == 1 else "#2ecc71"
         bars.append(
             f'<div style="margin:6px 0;">'
-            f'  <span style="display:inline-block; width:200px;">{emoji} {label} {is_pred}</span>'
+            f'  <span style="display:inline-block; width:200px; color:#eee;">{emoji} {label} {is_pred}</span>'
             f'  <div style="display:inline-block; width:300px; background:#333; '
             f'border-radius:4px; overflow:hidden; vertical-align:middle;">'
             f'    <div style="width:{pct:.1f}%; background:{bar_color}; '
             f'height:22px; border-radius:4px;"></div>'
             f'  </div>'
-            f'  <span style="margin-left:8px; font-weight:bold;">{pct:.1f}%</span>'
+            f'  <span style="margin-left:8px; font-weight:bold; color:#eee;">{pct:.1f}%</span>'
             f'</div>'
         )
 
@@ -209,7 +209,7 @@ def predict_sentiment(text: str) -> str:
 
     return (
         f'<div style="padding:16px; background:#1a1a2e; border-radius:8px; color:#eee;">'
-        f'  <h3 style="margin:0 0 12px 0;">Kết quả: {result_emoji} {result_label}</h3>'
+        f'  <h3 style="margin:0 0 12px 0; color:white;">Kết quả: {result_emoji} {result_label}</h3>'
         f'  {"".join(bars)}'
         f'</div>'
     )
@@ -247,22 +247,22 @@ def predict_absa(text: str) -> str:
             pct = probs[i][j] * 100
             bold = "font-weight:bold;" if j == pred_pol else ""
             prob_cells.append(
-                f'<td style="padding:8px; text-align:center; {bold}">{pct:.1f}%</td>'
+                f'<td style="padding:8px; text-align:center; color:#eee; {bold}">{pct:.1f}%</td>'
             )
 
         rows.append(
             f'<tr style="border-bottom:1px solid #333;">'
             f'  <td style="padding:8px; font-weight:bold; color:#4ecdc4;">{aspect}</td>'
-            f'  <td style="padding:8px; text-align:center;">{pol_emoji} {pol_label}</td>'
+            f'  <td style="padding:8px; text-align:center; color:#eee;">{pol_emoji} {pol_label}</td>'
             f'  {"".join(prob_cells)}'
             f'</tr>'
         )
 
     return (
         f'<div style="padding:16px; background:#1a1a2e; border-radius:8px; color:#eee;">'
-        f'  <h3 style="margin:0 0 12px 0;">Aspect-Based Sentiment Analysis</h3>'
+        f'  <h3 style="margin:0 0 12px 0; color:white;">Aspect-Based Sentiment Analysis</h3>'
         f'  <table style="width:100%; border-collapse:collapse;">'
-        f'    <tr style="background:#16213e;">'
+        f'    <tr style="background:#16213e; color:#eee;">'
         f'      <th style="padding:8px; text-align:left;">Aspect</th>'
         f'      <th style="padding:8px; text-align:center;">Prediction</th>'
         f'      <th style="padding:8px; text-align:center;">🔴 Neg</th>'
