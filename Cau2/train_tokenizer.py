@@ -26,6 +26,7 @@ from rich.table import Table
 from tokenizers import Tokenizer, models, trainers, pre_tokenizers, processors, decoders
 from transformers import PreTrainedTokenizerFast
 
+BASE_DIR = Path(__file__).resolve().parent
 console = Console()
 
 # ---------------------------------------------------------------------------
@@ -360,7 +361,7 @@ def main(corpus_path: Path) -> None:
     sampled_lines = _reservoir_sample(shard_paths, MAX_TRAIN_LINES, seed=SEED)
 
     # ---- Train SentencePiece ----
-    tokenizer_dir = Path("tokenizer")
+    tokenizer_dir = BASE_DIR / "tokenizer"
     sp_model_path = train_sentencepiece(sampled_lines, tokenizer_dir)
 
     # ---- Build HuggingFace wrapper ----

@@ -42,6 +42,7 @@ from tqdm import tqdm
 
 from models import MODEL_REGISTRY, _device
 
+BASE_DIR = Path(__file__).resolve().parent
 console = Console()
 
 # ---------------------------------------------------------------------------
@@ -203,14 +204,14 @@ def train_model(
     console.log(f"Device: [cyan]{device}[/cyan]")
 
     # ---- Paths ----
-    sp_model = Path("tokenizer") / "vi_bpe.model"
+    sp_model = BASE_DIR / "tokenizer/vi_bpe.model"
     if not sp_model.exists():
         console.log(f"[red]Tokenizer not found at {sp_model}. Run train_tokenizer.py first.[/red]")
         raise FileNotFoundError(sp_model)
 
-    ckpt_dir = Path("checkpoints")
+    ckpt_dir = BASE_DIR / "checkpoints"
     ckpt_dir.mkdir(exist_ok=True)
-    log_dir = Path("logs")
+    log_dir = BASE_DIR / "logs"
     log_dir.mkdir(exist_ok=True)
 
     # ---- Datasets ----
@@ -324,7 +325,7 @@ def train_model(
 # ---------------------------------------------------------------------------
 def compare_models() -> None:
     """Print a rich comparison table and save perplexity curve plot."""
-    log_dir = Path("logs")
+    log_dir = BASE_DIR / "logs"
     histories: list[dict] = []
     for name in MODEL_REGISTRY:
         hist_path = log_dir / f"{name}_history.json"
@@ -358,7 +359,7 @@ def compare_models() -> None:
     console.print(table)
 
     # ---- Perplexity curves ----
-    results_dir = Path("results")
+    results_dir = BASE_DIR / "results"
     results_dir.mkdir(exist_ok=True)
 
     fig, ax = plt.subplots(figsize=(10, 6))

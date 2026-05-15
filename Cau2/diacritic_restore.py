@@ -29,8 +29,8 @@ console = Console()
 SEED = 42
 DEVICE = _device()
 
-# ── Vietnamese syllable dictionary ────────────────────────────────────────
-SYLLABLE_FILE = Path("data/vi_syllables.txt")
+BASE_DIR = Path(__file__).resolve().parent
+SYLLABLE_FILE = BASE_DIR / "data/vi_syllables.txt"
 
 _VN_VOWELS_BASE = "aeiouy"
 _VN_DIACRITICS = {
@@ -274,7 +274,7 @@ def train_diacritics(corpus_path: Path, epochs: int = 5):
     max_cands = max(len(v) for v in syl_dict.values())
     console.log(f"Syllable dict: [cyan]{len(syl_dict)}[/cyan] entries, max candidates: {max_cands}")
 
-    sp_path = Path("tokenizer/vi_bpe.model")
+    sp_path = BASE_DIR / "tokenizer/vi_bpe.model"
     if not sp_path.exists():
         console.log("[red]Tokenizer not found. Run train_tokenizer.py first.[/red]")
         return
@@ -302,7 +302,7 @@ def train_diacritics(corpus_path: Path, epochs: int = 5):
     val_loader = DataLoader(val_ds, batch_size=64, shuffle=False, collate_fn=collate_fn, num_workers=0)
 
     # Load pretrained backbone
-    ckpt_path = Path("checkpoints/stacked_best.pt")
+    ckpt_path = BASE_DIR / "checkpoints/stacked_best.pt"
     vocab_size = sp.get_piece_size()
     backbone = StackedLSTM(vocab_size=vocab_size)
     if ckpt_path.exists():
@@ -359,12 +359,14 @@ def train_diacritics(corpus_path: Path, epochs: int = 5):
         console.log(f"Epoch {epoch+1}: train_acc={train_acc:.2f}% val_acc={val_acc:.2f}%")
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            torch.save(model.state_dict(), "checkpoints/diacritics_best.pt")
+            (BASE_DIR / "checkpoints").mkdir(parents=True, exist_ok=True)
+            torch.save(model.state_dict(), BASE_DIR / "checkpoints/diacritics_best.pt")
 
     # ── Evaluation on test set ────────────────────────────────────────────
     console.rule("[bold green]Test Evaluation[/bold green]")
-    if Path("checkpoints/diacritics_best.pt").exists():
-        model.load_state_dict(torch.load("checkpoints/diacritics_best.pt", map_location=device, weights_only=False))
+    dia_best_path = BASE_DIR / "checkpoints/diacritics_best.pt"
+    if dia_best_path.exists():
+        model.load_state_dict(torch.load(dia_best_path, map_location=device, weights_only=False))
     model.eval()
 
     word_correct, word_total, sent_exact, sent_total = 0, 0, 0, 0

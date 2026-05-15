@@ -28,8 +28,14 @@ from models import MODEL_REGISTRY, StackedLSTM, _device
 # Globals
 # ---------------------------------------------------------------------------
 DEVICE = _device()
-SP_MODEL_PATH = Path("tokenizer/vi_bpe.model")
-CKPT_DIR = Path("checkpoints")
+BASE_DIR = Path(__file__).resolve().parent
+
+import sys
+if str(BASE_DIR) not in sys.path:
+    sys.path.append(str(BASE_DIR))
+
+SP_MODEL_PATH = BASE_DIR / "tokenizer/vi_bpe.model"
+CKPT_DIR = BASE_DIR / "checkpoints"
 
 _sp: Optional[spm.SentencePieceProcessor] = None
 _models: Dict[str, torch.nn.Module] = {}
@@ -180,13 +186,12 @@ def generate_text(
     prompt_decoded = sp.decode(input_ids)
 
     return (
-        f'<div style="padding:16px; background:#1a1a2e; border-radius:8px; '
-        f'color:#eee; line-height:1.8; font-size:15px;">'
+        f'<div class="nlp-result-box">'
         f'<span style="color:#888;">🔤 Prompt:</span><br>'
         f'<span style="color:#4ecdc4; font-weight:bold;">{prompt_decoded}</span>'
         f'<span style="color:#f7dc6f;">{result[len(prompt_decoded):]}</span>'
         f'<br><br>'
-        f'<span style="font-size:12px; color:#666;">'
+        f'<span style="font-size:12px; color:#888;">'
         f'Model: {model_name} | Tokens generated: {len(generated) - len(input_ids)} | '
         f'Temp: {temperature} | Top-k: {top_k}</span>'
         f'</div>'
@@ -233,7 +238,7 @@ def restore_diacritics(text: str) -> str:
     changes = sum(1 for o, r in zip(orig_words, rest_words) if o != r)
 
     return (
-        f'<div style="padding:16px; background:#1a1a2e; border-radius:8px; color:#eee;">'
+        f'<div class="nlp-result-box">'
         f'  <div style="margin-bottom:12px;">'
         f'    <span style="color:#888; font-size:13px;">📥 Input (không dấu):</span><br>'
         f'    <span style="font-size:16px; color:#aaa;">{text}</span>'
@@ -242,7 +247,7 @@ def restore_diacritics(text: str) -> str:
         f'    <span style="color:#888; font-size:13px;">📤 Output (có dấu):</span><br>'
         f'    <div style="font-size:16px; line-height:2.2;">{" ".join(diff_parts)}</div>'
         f'  </div>'
-        f'  <div style="font-size:12px; color:#666;">'
+        f'  <div style="font-size:12px; color:#888;">'
         f'    Từ được phục hồi dấu: <span style="color:#2ecc71; font-weight:bold;">'
         f'{changes}/{len(orig_words)}</span>'
         f'  </div>'
@@ -257,6 +262,18 @@ CSS = """
 .gradio-container {
     max-width: 900px !important;
     margin: auto !important;
+}
+.nlp-result-box {
+    background: #1a1a2e !important;
+    color: white !important;
+    padding: 16px;
+    border-radius: 8px;
+    line-height: 1.8;
+    font-size: 15px;
+}
+.nlp-result-box span,
+.nlp-result-box div {
+    color: white !important;
 }
 """
 

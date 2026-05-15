@@ -6,8 +6,7 @@ from CC-100 and Wikipedia for LSTM language modelling.
 
 Sources
 -------
-* CC-100 vi   – ``datasets.load_dataset("cc100", lang="vi", streaming=True)``
-* Wikipedia vi – ``datasets.load_dataset("wikipedia", "20231101.vi", streaming=True)``
+* Wikipedia vi – ``datasets.load_dataset("wikimedia/wikipedia", "20231101.vi", streaming=True)``
 
 Run
 ---
@@ -224,17 +223,13 @@ def run_pipeline(corpus_path: Path) -> dict:
     console.log(f"Output directory: [cyan]{corpus_path}[/cyan]")
 
     # ---- Step 0: Load datasets with back-off ----
-    cc100_ds = _load_with_retry(
-        lambda: load_dataset("cc100", lang="vi", streaming=True, split="train", trust_remote_code=True),
-        "CC-100 vi",
-    )
     wiki_ds = _load_with_retry(
-        lambda: load_dataset("wikipedia", "20231101.vi", streaming=True, split="train", trust_remote_code=True),
+        lambda: load_dataset("wikimedia/wikipedia", "20231101.vi", streaming=True, split="train"),
         "Wikipedia vi",
     )
 
-    if cc100_ds is None and wiki_ds is None:
-        console.log("[red]Both datasets failed to load. Exiting.[/red]")
+    if wiki_ds is None:
+        console.log("[red]Dataset failed to load. Exiting.[/red]")
         sys.exit(1)
 
     # ---- Step 1-3: Stream → filter → dedup ----
@@ -281,10 +276,6 @@ def run_pipeline(corpus_path: Path) -> dict:
                     f"{total_tokens:,} tokens | "
                     f"{dup_count:,} dups removed"
                 )
-
-    # Process CC-100
-    if cc100_ds is not None:
-        _process_stream(cc100_ds, "text", "CC-100")
 
     # Process Wikipedia
     if wiki_ds is not None:
