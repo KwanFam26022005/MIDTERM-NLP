@@ -595,46 +595,18 @@ def main(ckpt_path: str, data_dir: str) -> None:
     )
 
     # ---- Run inference with torch.no_grad() ----
-    # NER — for accurate CPU latency, also run a separate pass on CPU
     print("[evaluate] Running NER inference...")
-    ner_preds, ner_labels, _ = _run_inference_ner(model, ner_loader, device)
-    # Latency on CPU
-    model_cpu = model.to(cpu_device)
-    model_cpu.eval()
-    ner_loader_cpu = build_task_dataloader(
-        test_set, "ner", tokenizer,
-        batch_size=INFERENCE_BATCH_SIZE, shuffle=False,
-    )
-    _, _, ner_latency = _run_inference_ner(model_cpu, ner_loader_cpu, cpu_device)
-    model.to(device)  # Move back
+    ner_preds, ner_labels, ner_latency = _run_inference_ner(model, ner_loader, device)
 
     print("[evaluate] Running Sentiment inference...")
-    sent_preds, sent_labels, _ = _run_inference_sentiment(
+    sent_preds, sent_labels, sent_latency = _run_inference_sentiment(
         model, sent_loader, device
     )
-    model_cpu = model.to(cpu_device)
-    sent_loader_cpu = build_task_dataloader(
-        test_set, "sentiment", tokenizer,
-        batch_size=INFERENCE_BATCH_SIZE, shuffle=False,
-    )
-    _, _, sent_latency = _run_inference_sentiment(
-        model_cpu, sent_loader_cpu, cpu_device
-    )
-    model.to(device)
 
     print("[evaluate] Running ABSA inference...")
-    absa_preds, absa_labels, _ = _run_inference_absa(
+    absa_preds, absa_labels, absa_latency = _run_inference_absa(
         model, absa_loader, device
     )
-    model_cpu = model.to(cpu_device)
-    absa_loader_cpu = build_task_dataloader(
-        test_set, "absa", tokenizer,
-        batch_size=INFERENCE_BATCH_SIZE, shuffle=False,
-    )
-    _, _, absa_latency = _run_inference_absa(
-        model_cpu, absa_loader_cpu, cpu_device
-    )
-    model.to(device)
 
     # ---- Compute metrics ----
     ner_result = evaluate_ner(ner_preds, ner_labels, ner_latency, model_size)

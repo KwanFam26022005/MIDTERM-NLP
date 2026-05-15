@@ -146,21 +146,20 @@ def predict_ner(text: str) -> str:
                 f'{word} <sup style="font-size:10px;">{tag}</sup></span>'
             )
         else:
-            html_parts.append(f'<span style="margin:1px; display:inline-block; color:#eee;">{word}</span>')
+            html_parts.append(f'<span style="margin:1px; display:inline-block; color:#eee !important;">{word}</span>')
 
     # Build legend
     legend = " | ".join(
-        f'<span style="background-color:{c}; color:white; padding:1px 6px; '
+        f'<span style="background-color:{c}; color:white !important; padding:1px 6px; '
         f'border-radius:3px; font-size:12px;">{e}</span>'
         for e, c in NER_COLORS.items()
     )
 
     return (
-        f'<div style="line-height:2.2; font-size:16px; padding:12px; '
-        f'background:#1a1a2e; border-radius:8px; color:#eee;">'
+        f'<div class="nlp-result-box" style="line-height:2.2; font-size:16px;">'
         f'{" ".join(html_parts)}'
         f'</div>'
-        f'<div style="margin-top:8px; font-size:13px; color:#888;">Legend: {legend}</div>'
+        f'<div class="nlp-legend" style="margin-top:8px; font-size:13px;">Legend: {legend}</div>'
     )
 
 
@@ -194,13 +193,13 @@ def predict_sentiment(text: str) -> str:
         bar_color = "#ff6b6b" if i == 0 else "#f7dc6f" if i == 1 else "#2ecc71"
         bars.append(
             f'<div style="margin:6px 0;">'
-            f'  <span style="display:inline-block; width:200px; color:#eee;">{emoji} {label} {is_pred}</span>'
+            f'  <span style="display:inline-block; width:200px; color:#eee !important;">{emoji} {label} {is_pred}</span>'
             f'  <div style="display:inline-block; width:300px; background:#333; '
             f'border-radius:4px; overflow:hidden; vertical-align:middle;">'
             f'    <div style="width:{pct:.1f}%; background:{bar_color}; '
             f'height:22px; border-radius:4px;"></div>'
             f'  </div>'
-            f'  <span style="margin-left:8px; font-weight:bold; color:#eee;">{pct:.1f}%</span>'
+            f'  <span style="margin-left:8px; font-weight:bold; color:#eee !important;">{pct:.1f}%</span>'
             f'</div>'
         )
 
@@ -208,8 +207,8 @@ def predict_sentiment(text: str) -> str:
     result_emoji = SENTIMENT_COLORS[pred]
 
     return (
-        f'<div style="padding:16px; background:#1a1a2e; border-radius:8px; color:#eee;">'
-        f'  <h3 style="margin:0 0 12px 0; color:white;">Kết quả: {result_emoji} {result_label}</h3>'
+        f'<div class="nlp-result-box">'
+        f'  <h3 style="margin:0 0 12px 0;">Kết quả: {result_emoji} {result_label}</h3>'
         f'  {"".join(bars)}'
         f'</div>'
     )
@@ -247,22 +246,22 @@ def predict_absa(text: str) -> str:
             pct = probs[i][j] * 100
             bold = "font-weight:bold;" if j == pred_pol else ""
             prob_cells.append(
-                f'<td style="padding:8px; text-align:center; color:#eee; {bold}">{pct:.1f}%</td>'
+                f'<td style="padding:8px; text-align:center; color:#eee !important; {bold}">{pct:.1f}%</td>'
             )
 
         rows.append(
             f'<tr style="border-bottom:1px solid #333;">'
-            f'  <td style="padding:8px; font-weight:bold; color:#4ecdc4;">{aspect}</td>'
-            f'  <td style="padding:8px; text-align:center; color:#eee;">{pol_emoji} {pol_label}</td>'
+            f'  <td class="aspect-name" style="padding:8px; font-weight:bold;">{aspect}</td>'
+            f'  <td style="padding:8px; text-align:center;">{pol_emoji} {pol_label}</td>'
             f'  {"".join(prob_cells)}'
             f'</tr>'
         )
 
     return (
-        f'<div style="padding:16px; background:#1a1a2e; border-radius:8px; color:#eee;">'
-        f'  <h3 style="margin:0 0 12px 0; color:white;">Aspect-Based Sentiment Analysis</h3>'
+        f'<div class="nlp-result-box">'
+        f'  <h3 style="margin:0 0 12px 0;">Aspect-Based Sentiment Analysis</h3>'
         f'  <table style="width:100%; border-collapse:collapse;">'
-        f'    <tr style="background:#16213e; color:#eee;">'
+        f'    <tr style="background:#16213e;">'
         f'      <th style="padding:8px; text-align:left;">Aspect</th>'
         f'      <th style="padding:8px; text-align:center;">Prediction</th>'
         f'      <th style="padding:8px; text-align:center;">🔴 Neg</th>'
@@ -308,6 +307,26 @@ CSS = """
 .gradio-container {
     max-width: 900px !important;
     margin: auto !important;
+}
+.nlp-result-box {
+    background: #1a1a2e !important;
+    color: white !important;
+    padding: 16px;
+    border-radius: 8px;
+}
+.nlp-result-box span,
+.nlp-result-box div,
+.nlp-result-box h3,
+.nlp-result-box table,
+.nlp-result-box th,
+.nlp-result-box td {
+    color: white !important;
+}
+.nlp-result-box .aspect-name {
+    color: #4ecdc4 !important;
+}
+.nlp-legend {
+    color: #888 !important;
 }
 """
 
