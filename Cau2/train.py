@@ -108,10 +108,11 @@ class LMDataset(Dataset):
         console.print(f"  Total tokens: [cyan]{len(self.data):,}[/cyan]")
 
     def __len__(self) -> int:
-        return max(0, len(self.data) - self.seq_len - 1)
+        return max(0, (len(self.data) - 1) // self.seq_len)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        chunk = self.data[idx : idx + self.seq_len + 1]
+        start_idx = idx * self.seq_len
+        chunk = self.data[start_idx : start_idx + self.seq_len + 1]
         return chunk[:-1], chunk[1:]
 
     @property
