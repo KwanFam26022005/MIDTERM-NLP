@@ -115,9 +115,11 @@ def _load_diacritics_model():
 
     dia_ckpt = CKPT_DIR / "diacritics_best.pt"
     if dia_ckpt.exists():
-        _diacritics_model.load_state_dict(
-            torch.load(dia_ckpt, map_location=DEVICE, weights_only=False)
-        )
+        dia_state = torch.load(dia_ckpt, map_location=DEVICE, weights_only=False)
+        if "model_state_dict" in dia_state:
+            _diacritics_model.load_state_dict(dia_state["model_state_dict"])
+        else:
+            _diacritics_model.load_state_dict(dia_state)
         print(f"[demo] Loaded diacritics checkpoint: {dia_ckpt}")
     else:
         print("[demo] ⚠️ Không tìm thấy diacritics checkpoint. Dùng trọng số ngẫu nhiên.")

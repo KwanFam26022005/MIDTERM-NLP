@@ -379,9 +379,11 @@ def run_pipeline(corpus_path: Path, reset: bool = False) -> dict:
 
     resume_state = {}
     skip_to_article = 0
+    completed_phase = 0
     if ckpt.exists():
         resume_state = ckpt.load()
         skip_to_article = resume_state.get("articles_processed", 0)
+        completed_phase = resume_state.get("completed_phase", 0)
 
         console.print()
         console.print(
@@ -397,43 +399,7 @@ def run_pipeline(corpus_path: Path, reset: bool = False) -> dict:
         console.print()
         console.print("  [dim]No checkpoint found — starting fresh run[/dim]")
 
-    # ================================================================
-    # PHASE 1: Load dataset
-    # ================================================================
-    _print_phase_banner(0)
-
-    wiki_ds = _load_with_retry(
-        lambda: load_dataset(
-            "wikimedia/wikipedia", "20231101.vi",
-            streaming=True, split="train",
-        ),
-        "Wikipedia vi",
-    )
-
-    if wiki_ds is None:
-        console.print("[red bold]❌ Dataset failed to load. Exiting.[/red bold]")
-        sys.exit(1)
-
-    # ================================================================
-    # PHASE 2 + 3 + 4: Stream → Filter → Dedup → Shard
-    # (merged into one streaming pass for efficiency)
-    # ================================================================
-    _print_phase_banner(1)
-    _print_phase_banner(2)
-    _print_phase_banner(3)
-
-    console.print(
-        "  [bold]Running phases 2-4 in a single streaming pass "
-        "(filter → dedup → shard)[/bold]"
-    )
-    console.print()
-
-    # Restore or init state
-    dedup = StreamingDeduplicator()
-    train_writer = ShardWriter(corpus_path / "train")
-    val_lines: list[str] = resume_state.get("val_lines", [])
-    test_lines: list[str] = resume_state.get("test_lines", [])
-
+    # ── Restore stats from checkpoint for later phases ──
     total_tokens = resume_state.get("total_tokens", 0)
     total_lines = resume_state.get("total_lines", 0)
     char_set: set[str] = resume_state.get("char_set", set())
@@ -441,168 +407,222 @@ def run_pipeline(corpus_path: Path, reset: bool = False) -> dict:
     dup_count = resume_state.get("dup_count", 0)
     articles_processed = resume_state.get("articles_processed", 0)
     lines_filtered_out = resume_state.get("lines_filtered_out", 0)
+    val_lines: list[str] = resume_state.get("val_lines", [])
+    test_lines: list[str] = resume_state.get("test_lines", [])
 
-    if "dedup_state" in resume_state:
-        dedup.restore_state(resume_state["dedup_state"])
+    # ══════════════════════════════════════════════════════════════
+    # FAST PATH: If phases 1-4 are already done, skip entirely
+    # ══════════════════════════════════════════════════════════════
+    if completed_phase >= 4:
+        console.print()
+        console.print(
+            Panel(
+                f"[bold green]⏭  Phases 1-4 already completed[/bold green]\n"
+                f"[dim]{_format_number(articles_processed)} articles • "
+                f"{_format_number(total_lines)} lines kept • "
+                f"{_format_number(dup_count)} dups removed[/dim]\n"
+                f"[dim]Skipping dataset loading & streaming — jumping to Phase 5[/dim]",
+                border_style="green",
+                title="✅ Skip",
+            )
+        )
+    else:
+        # ================================================================
+        # PHASE 1: Load dataset
+        # ================================================================
+        _print_phase_banner(0)
 
-    # Track shard writer offset for resume
-    train_writer.total_written = resume_state.get("train_lines_written", 0)
-
-    start_time = time.time()
-    last_checkpoint_time = start_time
-
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[bold blue]{task.description}[/bold blue]"),
-        BarColumn(bar_width=40),
-        TaskProgressColumn(),
-        MofNCompleteColumn(),
-        TextColumn("•"),
-        TimeElapsedColumn(),
-        TextColumn("•"),
-        TextColumn("[green]{task.fields[kept]}[/green] kept"),
-        TextColumn("[red]{task.fields[dups]}[/red] dups"),
-        TextColumn("[dim]{task.fields[filtered]}[/dim] filtered"),
-        console=console,
-        refresh_per_second=4,
-    ) as progress:
-        task = progress.add_task(
+        wiki_ds = _load_with_retry(
+            lambda: load_dataset(
+                "wikimedia/wikipedia", "20231101.vi",
+                streaming=True, split="train",
+            ),
             "Wikipedia vi",
-            total=WIKI_VI_APPROX_ARTICLES,
-            kept=_format_number(total_lines),
-            dups=_format_number(dup_count),
-            filtered=_format_number(lines_filtered_out),
         )
 
-        # Update progress bar if resuming
-        if articles_processed > 0:
-            progress.update(task, completed=articles_processed)
+        if wiki_ds is None:
+            console.print("[red bold]❌ Dataset failed to load. Exiting.[/red bold]")
+            sys.exit(1)
 
-        for example in wiki_ds:
-            articles_processed += 1
+        # ================================================================
+        # PHASE 2 + 3 + 4: Stream → Filter → Dedup → Shard
+        # (merged into one streaming pass for efficiency)
+        # ================================================================
+        _print_phase_banner(1)
+        _print_phase_banner(2)
+        _print_phase_banner(3)
 
-            # Skip already-processed articles on resume
-            if articles_processed <= skip_to_article:
-                if articles_processed % 50_000 == 0:
-                    progress.update(
-                        task,
-                        completed=articles_processed,
-                        description=f"⏩ Skipping (resume)",
-                        kept=_format_number(total_lines),
-                        dups=_format_number(dup_count),
-                        filtered=_format_number(lines_filtered_out),
-                    )
-                continue
+        console.print(
+            "  [bold]Running phases 2-4 in a single streaming pass "
+            "(filter → dedup → shard)[/bold]"
+        )
+        console.print()
 
-            raw = example.get("text", "")
-            if not raw:
-                progress.update(task, completed=articles_processed)
-                continue
+        # Restore or init state
+        dedup = StreamingDeduplicator()
+        train_writer = ShardWriter(corpus_path / "train")
 
-            for line in raw.split("\n"):
-                line = _nfc(line.strip())
+        if "dedup_state" in resume_state:
+            dedup.restore_state(resume_state["dedup_state"])
 
-                # Filter
-                if not _is_valid_line(line):
-                    lines_filtered_out += 1
-                    continue
+        # Track shard writer offset for resume
+        train_writer.total_written = resume_state.get("train_lines_written", 0)
 
-                # Dedup
-                if dedup.is_duplicate(line):
-                    dup_count += 1
-                    continue
+        start_time = time.time()
+        last_checkpoint_time = start_time
 
-                # Accept line
-                total_lines += 1
-                tokens = line.split()
-                n_tok = len(tokens)
-                total_tokens += n_tok
-                char_set.update(line)
-                sentence_lengths.append(n_tok)
-
-                # reservoir-sample val/test at ~1 % each
-                r = random.random()
-                if r < VAL_TEST_RATIO:
-                    val_lines.append(line)
-                elif r < 2 * VAL_TEST_RATIO:
-                    test_lines.append(line)
-                else:
-                    train_writer.add(line)
-
-            # Update progress bar
-            progress.update(
-                task,
-                completed=articles_processed,
-                description="Wikipedia vi",
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[bold blue]{task.description}[/bold blue]"),
+            BarColumn(bar_width=40),
+            TaskProgressColumn(),
+            MofNCompleteColumn(),
+            TextColumn("•"),
+            TimeElapsedColumn(),
+            TextColumn("•"),
+            TextColumn("[green]{task.fields[kept]}[/green] kept"),
+            TextColumn("[red]{task.fields[dups]}[/red] dups"),
+            TextColumn("[dim]{task.fields[filtered]}[/dim] filtered"),
+            console=console,
+            refresh_per_second=4,
+        ) as progress:
+            task = progress.add_task(
+                "Wikipedia vi",
+                total=WIKI_VI_APPROX_ARTICLES,
                 kept=_format_number(total_lines),
                 dups=_format_number(dup_count),
                 filtered=_format_number(lines_filtered_out),
             )
 
-            # Periodic checkpoint
-            now = time.time()
-            if articles_processed % CHECKPOINT_EVERY == 0 or (now - last_checkpoint_time) > 300:
-                ckpt.save({
-                    "articles_processed": articles_processed,
-                    "total_lines": total_lines,
-                    "total_tokens": total_tokens,
-                    "dup_count": dup_count,
-                    "lines_filtered_out": lines_filtered_out,
-                    "val_lines": val_lines,
-                    "test_lines": test_lines,
-                    "char_set": char_set,
-                    "sentence_lengths": sentence_lengths,
-                    "dedup_state": dedup.get_state(),
-                    "train_lines_written": train_writer.total_written,
-                    "completed_phase": 3,
-                })
-                last_checkpoint_time = now
+            # Update progress bar if resuming
+            if articles_processed > 0:
+                progress.update(task, completed=articles_processed)
 
-    elapsed = time.time() - start_time
-    console.print()
-    console.print(
-        f"  [bold green]✓ Streaming complete[/bold green] — "
-        f"{_format_number(articles_processed)} articles processed in "
-        f"{elapsed:.0f}s"
-    )
+            for example in wiki_ds:
+                articles_processed += 1
 
-    # Flush remaining train shards
-    console.print("  [dim]Flushing remaining train buffer …[/dim]")
-    train_writer.close()
+                # Skip already-processed articles on resume
+                if articles_processed <= skip_to_article:
+                    if articles_processed % 50_000 == 0:
+                        progress.update(
+                            task,
+                            completed=articles_processed,
+                            description=f"⏩ Skipping (resume)",
+                            kept=_format_number(total_lines),
+                            dups=_format_number(dup_count),
+                            filtered=_format_number(lines_filtered_out),
+                        )
+                    continue
 
-    # Write val / test
-    for split_name, split_data in [("val", val_lines), ("test", test_lines)]:
-        split_dir = corpus_path / split_name
-        split_dir.mkdir(parents=True, exist_ok=True)
-        out_path = split_dir / "shard_0000.txt"
-        if not out_path.exists():
-            with open(out_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(split_data))
-                f.write("\n")
-            console.print(
-                f"  [green]💾 Wrote {split_name}: "
-                f"{_format_number(len(split_data))} lines → {out_path}[/green]"
-            )
-        else:
-            console.print(
-                f"  [dim]{split_name} shard already exists — skipped[/dim]"
-            )
+                raw = example.get("text", "")
+                if not raw:
+                    progress.update(task, completed=articles_processed)
+                    continue
 
-    # Save checkpoint after writing splits
-    ckpt.save({
-        "articles_processed": articles_processed,
-        "total_lines": total_lines,
-        "total_tokens": total_tokens,
-        "dup_count": dup_count,
-        "lines_filtered_out": lines_filtered_out,
-        "val_lines": val_lines,
-        "test_lines": test_lines,
-        "char_set": char_set,
-        "sentence_lengths": sentence_lengths,
-        "dedup_state": dedup.get_state(),
-        "train_lines_written": train_writer.total_written,
-        "completed_phase": 4,
-    })
+                for line in raw.split("\n"):
+                    line = _nfc(line.strip())
+
+                    # Filter
+                    if not _is_valid_line(line):
+                        lines_filtered_out += 1
+                        continue
+
+                    # Dedup
+                    if dedup.is_duplicate(line):
+                        dup_count += 1
+                        continue
+
+                    # Accept line
+                    total_lines += 1
+                    tokens = line.split()
+                    n_tok = len(tokens)
+                    total_tokens += n_tok
+                    char_set.update(line)
+                    sentence_lengths.append(n_tok)
+
+                    # reservoir-sample val/test at ~1 % each
+                    r = random.random()
+                    if r < VAL_TEST_RATIO:
+                        val_lines.append(line)
+                    elif r < 2 * VAL_TEST_RATIO:
+                        test_lines.append(line)
+                    else:
+                        train_writer.add(line)
+
+                # Update progress bar
+                progress.update(
+                    task,
+                    completed=articles_processed,
+                    description="Wikipedia vi",
+                    kept=_format_number(total_lines),
+                    dups=_format_number(dup_count),
+                    filtered=_format_number(lines_filtered_out),
+                )
+
+                # Periodic checkpoint
+                now = time.time()
+                if articles_processed % CHECKPOINT_EVERY == 0 or (now - last_checkpoint_time) > 300:
+                    ckpt.save({
+                        "articles_processed": articles_processed,
+                        "total_lines": total_lines,
+                        "total_tokens": total_tokens,
+                        "dup_count": dup_count,
+                        "lines_filtered_out": lines_filtered_out,
+                        "val_lines": val_lines,
+                        "test_lines": test_lines,
+                        "char_set": char_set,
+                        "sentence_lengths": sentence_lengths,
+                        "dedup_state": dedup.get_state(),
+                        "train_lines_written": train_writer.total_written,
+                        "completed_phase": 3,
+                    })
+                    last_checkpoint_time = now
+
+        elapsed = time.time() - start_time
+        console.print()
+        console.print(
+            f"  [bold green]✓ Streaming complete[/bold green] — "
+            f"{_format_number(articles_processed)} articles processed in "
+            f"{elapsed:.0f}s"
+        )
+
+        # Flush remaining train shards
+        console.print("  [dim]Flushing remaining train buffer …[/dim]")
+        train_writer.close()
+
+        # Write val / test
+        for split_name, split_data in [("val", val_lines), ("test", test_lines)]:
+            split_dir = corpus_path / split_name
+            split_dir.mkdir(parents=True, exist_ok=True)
+            out_path = split_dir / "shard_0000.txt"
+            if not out_path.exists():
+                with open(out_path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(split_data))
+                    f.write("\n")
+                console.print(
+                    f"  [green]💾 Wrote {split_name}: "
+                    f"{_format_number(len(split_data))} lines → {out_path}[/green]"
+                )
+            else:
+                console.print(
+                    f"  [dim]{split_name} shard already exists — skipped[/dim]"
+                )
+
+        # Save checkpoint after writing splits
+        ckpt.save({
+            "articles_processed": articles_processed,
+            "total_lines": total_lines,
+            "total_tokens": total_tokens,
+            "dup_count": dup_count,
+            "lines_filtered_out": lines_filtered_out,
+            "val_lines": val_lines,
+            "test_lines": test_lines,
+            "char_set": char_set,
+            "sentence_lengths": sentence_lengths,
+            "dedup_state": dedup.get_state(),
+            "train_lines_written": resume_state.get("train_lines_written", 0),
+            "completed_phase": 4,
+        })
 
     # ================================================================
     # PHASE 5: Underthesea validation

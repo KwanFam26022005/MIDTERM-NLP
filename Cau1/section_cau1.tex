@@ -1,0 +1,421 @@
+% ===========================================================================
+% section_cau1.tex — Câu 1: Multi-Task Vietnamese NLP with PhoBERT
+% ===========================================================================
+% PACKAGES CẦN THÊM VÀO main.tex (preamble):
+% \usepackage{amsmath, amssymb}
+% \usepackage{graphicx}
+% \usepackage{booktabs}
+% \usepackage{multirow}
+% \usepackage{hyperref}
+% \usepackage{tikz}
+% \usetikzlibrary{positioning, arrows.meta, shapes.geometric, fit, calc}
+% \usepackage{listings}
+% \usepackage{xcolor}
+% \usepackage{subcaption}
+% \usepackage{float}
+% ===========================================================================
+
+\section{Câu 1: Multi-Task Learning cho NLP Tiếng Việt với PhoBERT}
+\label{sec:cau1}
+
+\subsection{Giới thiệu bài toán}
+
+Bài toán yêu cầu xây dựng một hệ thống NLP đa nhiệm vụ (multi-task) cho tiếng Việt,
+sử dụng chung một backbone PhoBERT và ba đầu ra (head) chuyên biệt cho ba tác vụ:
+
+\begin{enumerate}
+    \item \textbf{Named Entity Recognition (NER)}: Nhận diện thực thể có tên (PER, ORG, LOC, MISC) trên tập VLSP 2016 NER theo lược đồ IOB2.
+    \item \textbf{Sentiment Analysis}: Phân loại cảm xúc (Negative, Neutral, Positive) trên tập UIT-VSFC.
+    \item \textbf{Aspect-Based Sentiment Analysis (ABSA)}: Phân tích cảm xúc theo 10 khía cạnh sản phẩm trên tập UIT-ViSFD.
+\end{enumerate}
+
+Ý tưởng chính là \emph{parameter sharing}: backbone PhoBERT được chia sẻ giữa ba tác vụ,
+giúp mô hình học được biểu diễn ngôn ngữ chung phong phú hơn so với huấn luyện riêng lẻ,
+đồng thời giảm tổng số tham số cần lưu trữ.
+
+% -------------------------------------------------------------------
+\subsection{Cơ sở lý thuyết}
+% -------------------------------------------------------------------
+
+\subsubsection{PhoBERT — Pre-trained Language Model cho Tiếng Việt}
+
+PhoBERT \cite{phobert2020} là mô hình ngôn ngữ dựa trên kiến trúc RoBERTa,
+được huấn luyện trước trên 20\,GB văn bản tiếng Việt. Mô hình sử dụng:
+\begin{itemize}
+    \item Kiến trúc Transformer Encoder 12 lớp (base) với $H = 768$.
+    \item Tokenizer dựa trên BPE (Byte-Pair Encoding) với từ điển 64K subword.
+    \item Huấn luyện trước bằng Masked Language Modeling (MLM).
+\end{itemize}
+
+Biểu diễn ngữ cảnh cho token thứ $i$ được tính qua cơ chế Multi-Head Self-Attention:
+\begin{equation}
+    \text{Attention}(Q, K, V) = \text{softmax}\!\left(\frac{QK^\top}{\sqrt{d_k}}\right) V
+\end{equation}
+trong đó $Q = XW^Q$, $K = XW^K$, $V = XW^V$ với $d_k = H / n_{\text{heads}}$.
+
+\subsubsection{Multi-Task Learning}
+
+Multi-task learning tối ưu hàm mục tiêu kết hợp:
+\begin{equation}
+    \mathcal{L}_{\text{total}} = \sum_{t \in \{\text{ner}, \text{sent}, \text{absa}\}} w_t \cdot \mathcal{L}_t
+\end{equation}
+với các trọng số lấy mẫu $w_{\text{ner}} = 0.3$, $w_{\text{sent}} = 0.4$, $w_{\text{absa}} = 0.3$
+thực hiện qua \emph{alternating batch sampling}.
+
+\subsubsection{Conditional Random Field (CRF) cho NER}
+
+Đối với NER, thay vì phân loại độc lập từng token, ta sử dụng CRF
+để mô hình hoá quan hệ chuyển tiếp giữa nhãn liền kề.
+Xác suất của chuỗi nhãn $\mathbf{y}$ cho chuỗi quan sát $\mathbf{x}$:
+\begin{equation}
+    P(\mathbf{y} \mid \mathbf{x}) = \frac{
+        \exp\!\bigl(\sum_{i=1}^{n} \phi(y_i, \mathbf{x}, i) + \sum_{i=1}^{n-1} T_{y_i, y_{i+1}}\bigr)
+    }{
+        \sum_{\mathbf{y}'} \exp\!\bigl(\sum_{i=1}^{n} \phi(y'_i, \mathbf{x}, i) + \sum_{i=1}^{n-1} T_{y'_i, y'_{i+1}}\bigr)
+    }
+\end{equation}
+trong đó $\phi(y_i, \mathbf{x}, i)$ là emission score từ lớp Linear, còn $T$ là ma trận chuyển tiếp được học.
+Giải mã bằng thuật toán Viterbi với độ phức tạp $O(nC^2)$, $C$ là số nhãn.
+
+\subsubsection{Chiến lược Pooling cho Sentiment và ABSA}
+
+\begin{itemize}
+    \item \textbf{Sentiment}: Mean-pooling có che (masked) qua tất cả token không phải padding:
+    \begin{equation}
+        \mathbf{h}_{\text{sent}} = \frac{\sum_{i=1}^{L} m_i \cdot \mathbf{h}_i}{\sum_{i=1}^{L} m_i}, \quad
+        \hat{y} = \text{softmax}(W_s \cdot \text{Dropout}(\mathbf{h}_{\text{sent}}) + b_s)
+    \end{equation}
+    \item \textbf{ABSA}: Sử dụng biểu diễn token \texttt{[CLS]}:
+    \begin{equation}
+        \hat{Y}_{\text{absa}} = \text{reshape}\bigl(W_a \cdot \text{Dropout}(\mathbf{h}_{\text{CLS}}) + b_a\bigr) \in \mathbb{R}^{A \times P}
+    \end{equation}
+    với $A = 10$ aspects, $P = 3$ polarities. Loss là CrossEntropy trung bình qua tất cả aspects.
+\end{itemize}
+
+% -------------------------------------------------------------------
+\subsection{Kiến trúc hệ thống}
+% -------------------------------------------------------------------
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=0.6cm and 1.2cm,
+    block/.style={rectangle, draw=blue!70, fill=blue!8, rounded corners=4pt,
+                  minimum width=2.8cm, minimum height=0.8cm, align=center,
+                  font=\small},
+    head/.style={rectangle, draw=orange!70, fill=orange!10, rounded corners=4pt,
+                 minimum width=2.4cm, minimum height=0.7cm, align=center,
+                 font=\small},
+    data/.style={rectangle, draw=green!60!black, fill=green!8, rounded corners=4pt,
+                 minimum width=2.2cm, minimum height=0.65cm, align=center,
+                 font=\footnotesize},
+    loss/.style={ellipse, draw=red!70, fill=red!8, minimum width=1.4cm,
+                 minimum height=0.55cm, align=center, font=\footnotesize},
+    arr/.style={-{Stealth[length=5pt]}, thick, draw=gray!70},
+]
+
+% Input
+\node[block, minimum width=6cm] (input) {Input: \texttt{input\_ids}, \texttt{attention\_mask}};
+
+% Backbone
+\node[block, below=0.7cm of input, minimum width=6cm, fill=blue!15,
+      draw=blue!80, font=\small\bfseries] (backbone)
+      {PhoBERT Backbone (12 Transformer layers)\\$\mathbf{H} \in \mathbb{R}^{B \times L \times 768}$};
+
+\draw[arr] (input) -- (backbone);
+
+% Three heads
+\node[head, below left=1cm and 1.5cm of backbone] (ner)
+      {\textbf{NER Head}\\Linear + CRF};
+\node[head, below=1cm of backbone] (sent)
+      {\textbf{Sentiment Head}\\MeanPool + Linear};
+\node[head, below right=1cm and 1.5cm of backbone] (absa)
+      {\textbf{ABSA Head}\\CLS + Linear};
+
+\draw[arr] (backbone.south) -- ++(0,-0.3) -| (ner.north);
+\draw[arr] (backbone.south) -- (sent.north);
+\draw[arr] (backbone.south) -- ++(0,-0.3) -| (absa.north);
+
+% Outputs
+\node[loss, below=0.6cm of ner]  (l1) {CRF NLL};
+\node[loss, below=0.6cm of sent] (l2) {CrossEntropy};
+\node[loss, below=0.6cm of absa] (l3) {CrossEntropy};
+
+\draw[arr] (ner)  -- (l1);
+\draw[arr] (sent) -- (l2);
+\draw[arr] (absa) -- (l3);
+
+% Output labels
+\node[below=0.3cm of l1, font=\footnotesize\itshape, text=blue!70] {$[B,L,9]$ IOB2};
+\node[below=0.3cm of l2, font=\footnotesize\itshape, text=blue!70] {$[B,3]$};
+\node[below=0.3cm of l3, font=\footnotesize\itshape, text=blue!70] {$[B,10,3]$};
+
+% Datasets
+\node[data, above left=0.5cm and 0.6cm of input]  (d1) {VLSP NER};
+\node[data, above=0.5cm of input]                  (d2) {UIT-VSFC};
+\node[data, above right=0.5cm and 0.6cm of input]  (d3) {UIT-ViSFD};
+
+\draw[arr, dashed, green!50!black] (d1.south) -- ++(0,-0.15) -| ([xshift=-1cm]input.north);
+\draw[arr, dashed, green!50!black] (d2.south) -- (input.north);
+\draw[arr, dashed, green!50!black] (d3.south) -- ++(0,-0.15) -| ([xshift=1cm]input.north);
+
+\end{tikzpicture}
+\caption{Kiến trúc MultiTaskPhoBERT: một backbone chia sẻ, ba head chuyên biệt.}
+\label{fig:architecture}
+\end{figure}
+
+% -------------------------------------------------------------------
+\subsection{Dữ liệu}
+% -------------------------------------------------------------------
+
+\begin{table}[H]
+\centering
+\caption{Thống kê ba bộ dữ liệu sử dụng.}
+\label{tab:datasets}
+\begin{tabular}{llccc}
+\toprule
+\textbf{Dataset} & \textbf{Task} & \textbf{Train} & \textbf{Val} & \textbf{Test} \\
+\midrule
+UIT-VSFC  & Sentiment (3 lớp)      & 11\,426 & 1\,538 & 3\,166 \\
+UIT-ViSFD & ABSA (10 aspect $\times$ 3 pol.) & 8\,002 & 1\,001 & 1\,113 \\
+VLSP 2016 & NER (IOB2: PER, ORG, LOC, MISC) & 14\,861 & 2\,000 & 2\,736 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Tất cả dữ liệu được chuyển về một \texttt{DatasetDict} thống nhất
+với schema chung \texttt{(text, task, sentiment\_label, aspect\_labels, ner\_tags)}.
+Hàm \texttt{collate\_fn} tokenize bằng PhoBERT tokenizer, căn chỉnh nhãn sub-word
+cho NER (chỉ token đầu tiên của mỗi từ nhận nhãn thật, các sub-word còn lại nhận \texttt{PAD\_LABEL\_ID = -100}).
+
+% -------------------------------------------------------------------
+\subsection{Chiến lược huấn luyện}
+% -------------------------------------------------------------------
+
+\begin{table}[H]
+\centering
+\caption{Các siêu tham số huấn luyện.}
+\label{tab:hyperparams}
+\begin{tabular}{ll}
+\toprule
+\textbf{Tham số} & \textbf{Giá trị} \\
+\midrule
+Backbone learning rate  & $2 \times 10^{-5}$ \\
+Head learning rate      & $1 \times 10^{-3}$ \\
+Optimizer               & AdamW (weight decay = 0.01) \\
+Scheduler               & Linear warmup 10\% $\to$ Cosine decay \\
+Gradient clipping       & max\_norm = 1.0 \\
+Mixed precision         & AMP (\texttt{torch.amp.autocast}) \\
+Batch size              & 16 \\
+Max sequence length     & 256 \\
+Epochs                  & 5 \\
+Dropout (heads)         & 0.3 \\
+Task sampling ratio     & NER 30\% / Sentiment 40\% / ABSA 30\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Alternating batch sampling.}
+Thay vì huấn luyện tuần tự từng task,
+mỗi bước lấy một batch từ task theo tỉ lệ cố định.
+Cụ thể, trong mỗi epoch gồm $S$ steps tổng cộng
+($S = \sum_t |\text{DataLoader}_t|$),
+ta xây dựng lịch lặp (schedule) dạng round-robin
+với tỉ lệ NER:Sentiment:ABSA = 3:4:3.
+
+\paragraph{Class weights.}
+Do phân phối nhãn mất cân bằng (đặc biệt lớp Neutral trong Sentiment chỉ chiếm $\sim$5\%),
+ta tính inverse-frequency weights:
+\begin{equation}
+    w_c = \frac{N_{\text{total}}}{C \cdot N_c}
+\end{equation}
+và truyền vào CrossEntropy loss cho Sentiment và ABSA.
+
+% -------------------------------------------------------------------
+\subsection{Minh hoạ luồng xử lý}
+% -------------------------------------------------------------------
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=0.45cm,
+    step/.style={rectangle, draw=blue!60, fill=blue!5, rounded corners=3pt,
+                 minimum width=11cm, minimum height=0.65cm, align=left,
+                 font=\footnotesize},
+    arr/.style={-{Stealth[length=4pt]}, thick, draw=gray!60},
+]
+
+\node[step] (s1) {1. \textbf{Load data}: Đọc UIT-VSFC, UIT-ViSFD, VLSP-NER $\to$ \texttt{DatasetDict}};
+\node[step, below=of s1] (s2) {2. \textbf{Tokenize}: PhoBERT BPE tokenizer, padding/truncation $\to$ \texttt{max\_length=256}};
+\node[step, below=of s2] (s3) {3. \textbf{Build loaders}: Filter theo task, tạo DataLoader cho train/val mỗi task};
+\node[step, below=of s3] (s4) {4. \textbf{Train}: Alternating batch $\to$ Forward backbone $\to$ Task head $\to$ Loss $\to$ Backward};
+\node[step, below=of s4] (s5) {5. \textbf{Validate}: Mỗi cuối epoch, đánh giá F1 trên val set cho từng task};
+\node[step, below=of s5] (s6) {6. \textbf{Checkpoint}: Lưu best model per-task khi val F1 cải thiện};
+\node[step, below=of s6] (s7) {7. \textbf{Evaluate}: Load best checkpoint $\to$ Inference trên test set $\to$ Report};
+
+\foreach \i/\j in {s1/s2, s2/s3, s3/s4, s4/s5, s5/s6, s6/s7} {
+    \draw[arr] (\i) -- (\j);
+}
+
+\end{tikzpicture}
+\caption{Pipeline xử lý end-to-end của Câu 1.}
+\label{fig:pipeline}
+\end{figure}
+
+% -------------------------------------------------------------------
+\subsection{Kết quả thực nghiệm}
+% -------------------------------------------------------------------
+
+Kết quả đánh giá trên tập test với checkpoint tốt nhất cho từng task:
+
+\subsubsection{NER — VLSP 2016}
+
+\begin{table}[H]
+\centering
+\caption{Kết quả NER entity-level trên test set (seqeval).}
+\label{tab:ner_results}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Entity} & \textbf{Precision} & \textbf{Recall} & \textbf{F1} & \textbf{Support} \\
+\midrule
+PER  & 0.9144 & 0.9380 & 0.9260 & 3\,884 \\
+ORG  & 0.8887 & 0.8539 & 0.8710 & 3\,704 \\
+LOC  & 0.8905 & 0.9193 & 0.9047 & 3\,717 \\
+\midrule
+\textbf{Macro avg} & \textbf{0.8979} & \textbf{0.9037} & \textbf{0.9006} & 11\,305 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Mô hình đạt \textbf{Macro F1 = 0.9006} cho NER, vượt xa baseline all-O (F1 = 0.0).
+Entity PER đạt kết quả tốt nhất (F1 = 0.926) do tên người thường có pattern rõ ràng trong tiếng Việt.
+ORG là entity khó nhất (F1 = 0.871) do ranh giới tên tổ chức thường mơ hồ.
+
+\subsubsection{Sentiment Analysis — UIT-VSFC}
+
+\begin{table}[H]
+\centering
+\caption{Kết quả Sentiment Analysis trên test set.}
+\label{tab:sent_results}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Class} & \textbf{Precision} & \textbf{Recall} & \textbf{F1} & \textbf{Support} \\
+\midrule
+Negative & 0.9402 & 0.9595 & 0.9498 & 1\,409 \\
+Neutral  & 0.6885 & 0.5030 & 0.5813 & 167 \\
+Positive & 0.9477 & 0.9572 & 0.9524 & 1\,590 \\
+\midrule
+\multicolumn{2}{l}{\textbf{Macro F1}} & \multicolumn{2}{c}{\textbf{0.8278}} & \\
+\multicolumn{2}{l}{\textbf{Weighted F1}} & \multicolumn{2}{c}{\textbf{0.9317}} & \\
+\multicolumn{2}{l}{\textbf{Accuracy}} & \multicolumn{2}{c}{\textbf{0.9343}} & \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Accuracy đạt \textbf{93.4\%} (baseline majority-class: 50.2\%), cải thiện +43.2 điểm phần trăm.
+Lớp Neutral có F1 thấp nhất (0.5813) do chỉ chiếm $\sim$5\% dữ liệu test,
+gây khó khăn cho mô hình dù đã áp dụng class weights.
+
+\subsubsection{ABSA — UIT-ViSFD}
+
+\begin{table}[H]
+\centering
+\caption{Kết quả ABSA per-aspect trên test set.}
+\label{tab:absa_results}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Aspect} & \textbf{F1 Macro} & \textbf{F1 Micro} & \textbf{Accuracy} \\
+\midrule
+SCREEN      & 0.8344 & 0.9438 & 94.4\% \\
+CAMERA      & 0.9072 & 0.9487 & 94.9\% \\
+FEATURES    & 0.8335 & 0.8840 & 88.4\% \\
+BATTERY     & 0.9070 & 0.9209 & 92.1\% \\
+PERFORMANCE & 0.8284 & 0.8323 & 83.2\% \\
+STORAGE     & 0.7112 & 0.9915 & 99.2\% \\
+DESIGN      & 0.8216 & 0.9353 & 93.5\% \\
+PRICE       & 0.8188 & 0.9402 & 94.0\% \\
+GENERAL     & 0.7994 & 0.8242 & 82.4\% \\
+SER\&ACC    & 0.8265 & 0.9056 & 90.6\% \\
+\midrule
+\multicolumn{2}{l}{\textbf{Overall Micro F1}} & \multicolumn{2}{c}{\textbf{0.9126}} \\
+\multicolumn{2}{l}{\textbf{Overall Macro F1}} & \multicolumn{2}{c}{\textbf{0.8661}} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+ABSA đạt \textbf{Overall Micro F1 = 0.9126} so với baseline majority-polarity (0.7345), cải thiện +17.8 điểm.
+Aspect CAMERA đạt F1 macro cao nhất (0.907), trong khi STORAGE có F1 macro thấp nhất (0.711)
+do phân phối cực kỳ lệch (hầu hết là neutral).
+
+% -------------------------------------------------------------------
+\subsection{So sánh với Baseline}
+% -------------------------------------------------------------------
+
+\begin{table}[H]
+\centering
+\caption{So sánh tổng hợp MultiTaskPhoBERT vs.\ các baseline đơn giản.}
+\label{tab:comparison}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Task} & \textbf{Baseline} & \textbf{MultiTaskPhoBERT} & \textbf{$\Delta$} \\
+\midrule
+NER (Macro F1)         & 0.0000 (all-O) & \textbf{0.9006} & +0.9006 \\
+Sentiment (Macro F1)   & 0.5022 (majority) & \textbf{0.8278} & +0.3256 \\
+ABSA (Micro F1)        & 0.7345 (majority pol.) & \textbf{0.9126} & +0.1781 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% -------------------------------------------------------------------
+\subsection{Thông tin mô hình}
+% -------------------------------------------------------------------
+
+\begin{table}[H]
+\centering
+\caption{Thông tin kỹ thuật mô hình.}
+\label{tab:model_info}
+\begin{tabular}{ll}
+\toprule
+\textbf{Thuộc tính} & \textbf{Giá trị} \\
+\midrule
+Backbone            & \texttt{vinai/phobert-base} (RoBERTa, 12 layers) \\
+Hidden size         & 768 \\
+Model size          & 515.11\,MB \\
+NER labels          & 9 (O, B/I-PER, B/I-ORG, B/I-LOC, B/I-MISC) \\
+Sentiment labels    & 3 (Negative, Neutral, Positive) \\
+ABSA output         & $10 \times 3 = 30$ logits \\
+Latency (NER)       & $\sim$12.7\,ms/sample \\
+Latency (Sent/ABSA) & $\sim$0.5\,ms/sample \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% -------------------------------------------------------------------
+\subsection{Phân tích và thảo luận}
+% -------------------------------------------------------------------
+
+\paragraph{Ưu điểm của Multi-Task Learning.}
+\begin{itemize}
+    \item Chia sẻ backbone giúp mô hình học biểu diễn ngôn ngữ phong phú hơn
+          từ nhiều tác vụ liên quan (NER cung cấp thông tin cú pháp, Sentiment cung cấp ngữ nghĩa).
+    \item Tiết kiệm bộ nhớ: chỉ cần lưu 1 backbone ($\sim$500\,MB) thay vì 3 mô hình riêng.
+    \item Regularization hiệu quả: mô hình phải đồng thời giải tốt 3 bài toán,
+          giảm nguy cơ overfitting cho từng task.
+\end{itemize}
+
+\paragraph{Hạn chế.}
+\begin{itemize}
+    \item \textbf{Class imbalance}: Lớp Neutral trong Sentiment và một số aspect hiếm trong ABSA
+          vẫn có F1 thấp dù đã dùng class weights.
+    \item \textbf{MISC entity}: Không có support trong test set VLSP 2016, nên không đánh giá được.
+    \item \textbf{Task interference}: Trong một số trường hợp, gradient từ task này
+          có thể ``can thiệp'' tiêu cực đến task khác (negative transfer).
+\end{itemize}
+
+\paragraph{Hướng cải tiến.}
+\begin{itemize}
+    \item Thêm focal loss hoặc oversampling cho lớp thiểu số.
+    \item Sử dụng task-specific adapters (LoRA/Adapter layers) thay vì fine-tune toàn bộ backbone.
+    \item Thử nghiệm với PhoBERT-large ($H=1024$, 24 layers) cho kết quả cao hơn.
+    \item Áp dụng gradient surgery hoặc PCGrad để giảm task interference.
+\end{itemize}

@@ -4,9 +4,17 @@ diacritic_restore.py
 Syllable-level sequence labelling that restores Vietnamese tonal
 diacritics using a pretrained StackedLSTM as feature extractor.
 
+Features
+--------
+* Proper syllable-token alignment (track boundaries per word)
+* Checkpoint/resume for training
+* Progress bars for all phases
+
 Run
 ---
     python diacritic_restore.py --corpus corpus --epochs 5
+    python diacritic_restore.py --corpus corpus --epochs 5 --ckpt_dir /path/to/save
+    python diacritic_restore.py --corpus corpus --resume   # continue from last
 """
 from __future__ import annotations
 import argparse, json, math, os, random, re, sys, time, unicodedata
@@ -19,6 +27,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from rich.console import Console
+from rich.panel import Panel
 from rich.table import Table
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
@@ -81,7 +90,6 @@ def _generate_syllable_dict() -> Dict[str, List[str]]:
         for vn in vowel_nuclei:
             for fn in finals:
                 for tn in tones:
-                    base_syl = ci + vn + fn
                     toned = unicodedata.normalize("NFC", ci + vn + tn + fn)
                     syllables.add(toned)
     result: Dict[str, List[str]] = defaultdict(list)
@@ -103,17 +111,18 @@ def load_syllable_dict() -> Dict[str, List[str]]:
                     mapping[parts[0]] = parts[1].split(",")
         if mapping:
             return mapping
-    console.log("[yellow]Generating syllable dictionary …[/yellow]")
+    console.print("  [yellow]Generating syllable dictionary …[/yellow]")
     mapping = _generate_syllable_dict()
     SYLLABLE_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(SYLLABLE_FILE, "w", encoding="utf-8") as f:
         for k in sorted(mapping):
             f.write(f"{k}\t{','.join(mapping[k])}\n")
-    console.log(f"[green]✓ Saved {len(mapping)} entries → {SYLLABLE_FILE}[/green]")
+    console.print(f"  [green]✓ Saved {len(mapping)} entries → {SYLLABLE_FILE}[/green]")
     return mapping
 
 # ── Data generation ───────────────────────────────────────────────────────
 def generate_pairs(corpus_path: Path, n_samples: int = 500_000) -> List[Tuple[List[str], List[str]]]:
+    """Generate (stripped, original) word-list pairs from corpus — with progress."""
     rng = random.Random(SEED)
     shard_dir = corpus_path / "train"
     if not shard_dir.exists():
@@ -121,8 +130,9 @@ def generate_pairs(corpus_path: Path, n_samples: int = 500_000) -> List[Tuple[Li
     files = sorted(shard_dir.glob("shard_*.txt"))
     if not files:
         files = sorted(corpus_path.glob("**/*.txt"))
+
     lines: List[str] = []
-    for fp in files:
+    for fp in tqdm(files, desc="  Reading shards", leave=False):
         with open(fp, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
@@ -132,18 +142,21 @@ def generate_pairs(corpus_path: Path, n_samples: int = 500_000) -> List[Tuple[Li
                         break
         if len(lines) >= n_samples * 3:
             break
+
     rng.shuffle(lines)
     pairs: List[Tuple[List[str], List[str]]] = []
-    for line in lines[:n_samples]:
+    for line in tqdm(lines[:n_samples], desc="  Building pairs", leave=False):
         original = line.lower().split()
         stripped = [_strip_diacritics(w).lower() for w in original]
         if stripped and original:
             pairs.append((stripped, original))
-    console.log(f"Generated [cyan]{len(pairs):,}[/cyan] pairs")
+    console.print(f"  [green]✓[/green] Generated [cyan]{len(pairs):,}[/cyan] pairs")
     return pairs
 
 # ── Dataset ───────────────────────────────────────────────────────────────
 class DiacriticDataset(Dataset):
+    """Dataset that tracks token boundaries per syllable for proper alignment."""
+
     def __init__(self, pairs, syl_dict, sp_model_path, max_len=64):
         self.pairs = pairs
         self.syl_dict = syl_dict
@@ -159,11 +172,19 @@ class DiacriticDataset(Dataset):
         stripped, original = self.pairs[idx]
         stripped = stripped[:self.max_len]
         original = original[:self.max_len]
+
+        # Encode each syllable separately and track boundaries
         input_ids = []
+        boundaries = []  # (start, end) token index for each syllable
         for w in stripped:
             ids = self.sp.encode(w)
+            start = len(input_ids)
             input_ids.extend(ids)
+            end = len(input_ids)
+            boundaries.append((start, end))
+
         input_ids = input_ids[:self.max_len * 4]
+
         labels = []
         cand_masks = []
         for s_w, o_w in zip(stripped, original):
@@ -172,11 +193,13 @@ class DiacriticDataset(Dataset):
             labels.append(label_idx)
             mask = [1]*len(cands) + [0]*(self.max_cands - len(cands))
             cand_masks.append(mask[:self.max_cands])
+
         n_syls = len(labels)
         return {
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
             "labels": torch.tensor(labels, dtype=torch.long),
             "cand_masks": torch.tensor(cand_masks, dtype=torch.float),
+            "boundaries": boundaries,  # list of (start, end) tuples
             "n_syls": n_syls,
             "n_tokens": len(input_ids),
         }
@@ -189,16 +212,33 @@ def collate_fn(batch):
     input_ids = torch.zeros(B, max_tok, dtype=torch.long)
     labels = torch.full((B, max_syl), -1, dtype=torch.long)
     cand_masks = torch.zeros(B, max_syl, max_cand)
+    # Store boundaries as padded tensor: (B, max_syl, 2)
+    boundaries = torch.zeros(B, max_syl, 2, dtype=torch.long)
     for i, b in enumerate(batch):
         nt = b["n_tokens"]
         ns = b["n_syls"]
         input_ids[i, :nt] = b["input_ids"]
         labels[i, :ns] = b["labels"]
         cand_masks[i, :ns] = b["cand_masks"]
-    return {"input_ids": input_ids, "labels": labels, "cand_masks": cand_masks}
+        for j, (s, e) in enumerate(b["boundaries"][:ns]):
+            boundaries[i, j, 0] = s
+            boundaries[i, j, 1] = e
+    return {
+        "input_ids": input_ids,
+        "labels": labels,
+        "cand_masks": cand_masks,
+        "boundaries": boundaries,
+    }
 
 # ── Model ─────────────────────────────────────────────────────────────────
 class DiaCorrectionModel(nn.Module):
+    """
+    Diacritic correction using pretrained StackedLSTM backbone.
+
+    Key fix: uses tracked token boundaries to mean-pool LSTM hidden states
+    per syllable, instead of the previous naive uniform-step approach.
+    """
+
     def __init__(self, backbone: StackedLSTM, max_candidates: int = 50, freeze_bottom: int = 2):
         super().__init__()
         self.backbone = backbone
@@ -209,51 +249,85 @@ class DiaCorrectionModel(nn.Module):
                 if f"weight_ih_l{i}" in name or f"weight_hh_l{i}" in name or f"bias_ih_l{i}" in name or f"bias_hh_l{i}" in name:
                     param.requires_grad = False
         self.head = nn.Sequential(
-            nn.Linear(self.hidden_dim, 128),
+            nn.Linear(self.hidden_dim, 256),
             nn.ReLU(),
-            nn.Linear(128, max_candidates),
+            nn.Dropout(0.2),
+            nn.Linear(256, max_candidates),
         )
         self.max_candidates = max_candidates
 
-    def forward(self, input_ids, cand_masks=None):
+    def forward(self, input_ids, cand_masks=None, boundaries=None):
+        """
+        Forward pass with proper syllable-token alignment.
+
+        Parameters
+        ----------
+        input_ids  : (B, T) token ids
+        cand_masks : (B, S, C) candidate masks
+        boundaries : (B, S, 2) start/end token indices per syllable
+        """
         emb = self.backbone.embedding(input_ids)
-        lstm_out, _ = self.backbone.lstm(emb)
-        # Pool over token dimension per syllable — use mean of all tokens
-        pooled = lstm_out.mean(dim=1, keepdim=True).expand(-1, cand_masks.size(1), -1) if cand_masks is not None else lstm_out
-        # Simple approach: use LSTM output averaged, then project per syllable
-        # We'll take sliding windows of the LSTM output
+        lstm_out, _ = self.backbone.lstm(emb)  # (B, T, H)
+
         B, T, H = lstm_out.shape
-        if cand_masks is not None:
+
+        if boundaries is not None and cand_masks is not None:
             S = cand_masks.size(1)
-            # Distribute LSTM hidden states across syllables
-            step = max(1, T // max(S, 1))
-            indices = [min(i * step + step - 1, T - 1) for i in range(S)]
-            syl_hidden = lstm_out[:, indices, :]  # (B, S, H)
+            # Mean-pool LSTM hidden states per syllable using tracked boundaries
+            syl_hidden = torch.zeros(B, S, H, device=lstm_out.device)
+            for b_idx in range(B):
+                for s_idx in range(S):
+                    start = boundaries[b_idx, s_idx, 0].item()
+                    end = boundaries[b_idx, s_idx, 1].item()
+                    if end > start and end <= T:
+                        syl_hidden[b_idx, s_idx] = lstm_out[b_idx, start:end].mean(dim=0)
+                    elif start < T:
+                        syl_hidden[b_idx, s_idx] = lstm_out[b_idx, start]
         else:
             syl_hidden = lstm_out
+
         logits = self.head(syl_hidden)  # (B, S, max_cand)
         if cand_masks is not None:
             logits = logits.masked_fill(cand_masks == 0, float('-inf'))
         return logits
 
     def restore(self, text: str, syl_dict: Dict[str, List[str]], sp, beam_width: int = 5) -> str:
+        """Restore diacritics for a single input string."""
         self.eval()
         device = next(self.parameters()).device
         words = text.lower().split()
         stripped = [_strip_diacritics(w).lower() for w in words]
+
+        # Encode with boundary tracking
         input_ids = []
+        boundaries = []
         for w in stripped:
-            input_ids.extend(sp.encode(w))
+            ids = sp.encode(w)
+            start = len(input_ids)
+            input_ids.extend(ids)
+            end = len(input_ids)
+            boundaries.append((start, end))
+
         input_ids = input_ids[:256]
         input_t = torch.tensor([input_ids], dtype=torch.long, device=device)
+
         S = len(stripped)
         cands_list = [syl_dict.get(s, [s]) for s in stripped]
         max_c = max(len(c) for c in cands_list) if cands_list else 1
+
         mask = torch.zeros(1, S, max_c, device=device)
         for i, c in enumerate(cands_list):
             mask[0, i, :len(c)] = 1.0
+
+        # Build boundaries tensor
+        bounds_t = torch.zeros(1, S, 2, dtype=torch.long, device=device)
+        for i, (s, e) in enumerate(boundaries):
+            bounds_t[0, i, 0] = s
+            bounds_t[0, i, 1] = min(e, len(input_ids))
+
         with torch.no_grad():
-            logits = self.forward(input_t, mask)  # (1, S, max_c)
+            logits = self.forward(input_t, mask, bounds_t)  # (1, S, max_c)
+
         result = []
         for i, (s_w, cands) in enumerate(zip(stripped, cands_list)):
             if i < logits.size(1):
@@ -265,68 +339,122 @@ class DiaCorrectionModel(nn.Module):
         return " ".join(result)
 
 # ── Training ──────────────────────────────────────────────────────────────
-def train_diacritics(corpus_path: Path, epochs: int = 5):
+def train_diacritics(corpus_path: Path, epochs: int = 5, ckpt_dir: Path | None = None, resume: bool = False):
     device = _device()
-    console.rule("[bold blue]Diacritic Restoration Training[/bold blue]")
-    console.log(f"Device: [cyan]{device}[/cyan]")
+
+    if ckpt_dir is None:
+        ckpt_dir = BASE_DIR / "checkpoints"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    console.print()
+    console.print(
+        Panel.fit(
+            "[bold white]Diacritic Restoration Training[/bold white]\n"
+            f"[dim]Device: {device}  •  Epochs: {epochs}  •  Checkpoints: {ckpt_dir}[/dim]",
+            border_style="blue",
+            title="🔤 Diacritics",
+        )
+    )
+
+    # ── Phase 1: Load syllable dict & tokenizer ──
+    console.print()
+    console.rule("[bold cyan]Phase 1/4: Setup[/bold cyan]")
 
     syl_dict = load_syllable_dict()
     max_cands = max(len(v) for v in syl_dict.values())
-    console.log(f"Syllable dict: [cyan]{len(syl_dict)}[/cyan] entries, max candidates: {max_cands}")
+    console.print(f"  Syllable dict: [cyan]{len(syl_dict)}[/cyan] entries, max candidates: {max_cands}")
 
     sp_path = BASE_DIR / "tokenizer/vi_bpe.model"
     if not sp_path.exists():
-        console.log("[red]Tokenizer not found. Run train_tokenizer.py first.[/red]")
+        console.print("[red]❌ Tokenizer not found. Run train_tokenizer.py first.[/red]")
         return
 
     sp = spm.SentencePieceProcessor()
     sp.load(str(sp_path))
 
-    # Generate pairs
-    console.log("[bold]Generating training pairs …[/bold]")
+    # ── Phase 2: Generate pairs ──
+    console.print()
+    console.rule("[bold cyan]Phase 2/4: Data Generation[/bold cyan]")
+
     all_pairs = generate_pairs(corpus_path, n_samples=500_000)
     random.Random(SEED).shuffle(all_pairs)
-    n = len(all_pairs)
     test_pairs = all_pairs[:5000]
     val_pairs = all_pairs[5000:10000]
     train_pairs = all_pairs[10000:]
 
     train_ds = DiacriticDataset(train_pairs, syl_dict, sp_path, max_len=64)
     val_ds = DiacriticDataset(val_pairs, syl_dict, sp_path, max_len=64)
-    test_ds = DiacriticDataset(test_pairs, syl_dict, sp_path, max_len=64)
     train_ds.max_cands = max_cands
     val_ds.max_cands = max_cands
-    test_ds.max_cands = max_cands
 
     train_loader = DataLoader(train_ds, batch_size=64, shuffle=True, collate_fn=collate_fn, drop_last=True, num_workers=0)
     val_loader = DataLoader(val_ds, batch_size=64, shuffle=False, collate_fn=collate_fn, num_workers=0)
 
-    # Load pretrained backbone
-    ckpt_path = BASE_DIR / "checkpoints/stacked_best.pt"
+    # ── Phase 3: Build model ──
+    console.print()
+    console.rule("[bold cyan]Phase 3/4: Model Setup[/bold cyan]")
+
+    backbone_ckpt_path = ckpt_dir / "stacked_best.pt"
     vocab_size = sp.get_piece_size()
     backbone = StackedLSTM(vocab_size=vocab_size)
-    if ckpt_path.exists():
-        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    if backbone_ckpt_path.exists():
+        ckpt = torch.load(backbone_ckpt_path, map_location=device, weights_only=False)
         backbone.load_state_dict(ckpt["model_state_dict"])
-        console.log("[green]✓ Loaded pretrained StackedLSTM backbone[/green]")
+        console.print("  [green]✓ Loaded pretrained StackedLSTM backbone[/green]")
     else:
-        console.log("[yellow]No pretrained checkpoint found — training from scratch[/yellow]")
+        console.print("  [yellow]⚠ No pretrained checkpoint found — training from scratch[/yellow]")
 
     model = DiaCorrectionModel(backbone, max_candidates=max_cands, freeze_bottom=2).to(device)
-    console.log(f"Trainable params: [cyan]{sum(p.numel() for p in model.parameters() if p.requires_grad):,}[/cyan]")
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    console.print(f"  Trainable params: [cyan]{trainable:,}[/cyan]")
 
     optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=5e-4)
     criterion = nn.CrossEntropyLoss(ignore_index=-1)
 
+    # ── Resume ──
+    dia_ckpt_path = ckpt_dir / "diacritics_best.pt"
+    start_epoch = 0
     best_val_acc = 0.0
-    for epoch in range(epochs):
+
+    if resume and dia_ckpt_path.exists():
+        console.print()
+        console.print(
+            Panel(
+                f"[bold yellow]▶  Resuming from checkpoint[/bold yellow]\n"
+                f"[dim]{dia_ckpt_path}[/dim]",
+                border_style="yellow",
+                title="♻️ Resume",
+            )
+        )
+        ckpt = torch.load(dia_ckpt_path, map_location=device, weights_only=False)
+        if "model_state_dict" in ckpt:
+            model.load_state_dict(ckpt["model_state_dict"])
+            start_epoch = ckpt.get("epoch", 0) + 1
+            best_val_acc = ckpt.get("best_val_acc", 0.0)
+            if "optimizer_state_dict" in ckpt:
+                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        else:
+            # Legacy format: state_dict directly
+            model.load_state_dict(ckpt)
+        console.print(f"  Resumed at epoch [cyan]{start_epoch}[/cyan], best val_acc=[cyan]{best_val_acc:.2f}%[/cyan]")
+
+    # ── Phase 4: Training ──
+    console.print()
+    console.rule("[bold cyan]Phase 4/4: Training[/bold cyan]")
+
+    t0 = time.time()
+    for epoch in range(start_epoch, epochs):
+        console.print(f"\n  [bold]━━━ Epoch {epoch+1}/{epochs} ━━━[/bold]")
+
         model.train()
         total_loss, total_correct, total_count = 0.0, 0, 0
-        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}", leave=False):
+        for batch in tqdm(train_loader, desc=f"  train", leave=False):
             ids = batch["input_ids"].to(device)
             labels = batch["labels"].to(device)
             masks = batch["cand_masks"].to(device)
-            logits = model(ids, masks)
+            bounds = batch["boundaries"].to(device)
+
+            logits = model(ids, masks, bounds)
             B, S, C = logits.shape
             loss = criterion(logits.reshape(-1, C), labels.reshape(-1))
             optimizer.zero_grad()
@@ -341,38 +469,62 @@ def train_diacritics(corpus_path: Path, epochs: int = 5):
                 total_count += valid.sum().item()
 
         train_acc = total_correct / max(total_count, 1) * 100
+
         # Validation
         model.eval()
         val_correct, val_total = 0, 0
         with torch.no_grad():
-            for batch in val_loader:
+            for batch in tqdm(val_loader, desc="  val  ", leave=False):
                 ids = batch["input_ids"].to(device)
                 labels = batch["labels"].to(device)
                 masks = batch["cand_masks"].to(device)
-                logits = model(ids, masks)
+                bounds = batch["boundaries"].to(device)
+
+                logits = model(ids, masks, bounds)
                 valid = labels != -1
                 if valid.any():
                     preds = logits.argmax(dim=-1)
                     val_correct += (preds[valid] == labels[valid]).sum().item()
                     val_total += valid.sum().item()
+
         val_acc = val_correct / max(val_total, 1) * 100
-        console.log(f"Epoch {epoch+1}: train_acc={train_acc:.2f}% val_acc={val_acc:.2f}%")
+
+        elapsed = time.time() - t0
+        console.print(
+            f"  train_acc=[cyan]{train_acc:.2f}%[/cyan]  "
+            f"val_acc=[bold cyan]{val_acc:.2f}%[/bold cyan]  "
+            f"⏱ {elapsed/60:.1f} min"
+        )
+
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            (BASE_DIR / "checkpoints").mkdir(parents=True, exist_ok=True)
-            torch.save(model.state_dict(), BASE_DIR / "checkpoints/diacritics_best.pt")
+            torch.save(
+                {
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "epoch": epoch,
+                    "best_val_acc": best_val_acc,
+                },
+                dia_ckpt_path,
+            )
+            console.print(f"  [green]💾 Saved best (val_acc={val_acc:.2f}%) → {dia_ckpt_path}[/green]")
 
-    # ── Evaluation on test set ────────────────────────────────────────────
+    # ── Test Evaluation ──
+    console.print()
     console.rule("[bold green]Test Evaluation[/bold green]")
-    dia_best_path = BASE_DIR / "checkpoints/diacritics_best.pt"
-    if dia_best_path.exists():
-        model.load_state_dict(torch.load(dia_best_path, map_location=device, weights_only=False))
+
+    if dia_ckpt_path.exists():
+        ckpt = torch.load(dia_ckpt_path, map_location=device, weights_only=False)
+        if "model_state_dict" in ckpt:
+            model.load_state_dict(ckpt["model_state_dict"])
+        else:
+            model.load_state_dict(ckpt)
     model.eval()
 
     word_correct, word_total, sent_exact, sent_total = 0, 0, 0, 0
     demo_rows = []
     with torch.no_grad():
-        for i, (stripped, original) in enumerate(tqdm(test_pairs, desc="Testing")):
+        for i, (stripped, original) in enumerate(tqdm(test_pairs, desc="  Testing")):
             input_text = " ".join(stripped)
             predicted = model.restore(input_text, syl_dict, sp)
             gold = " ".join(original)
@@ -391,11 +543,11 @@ def train_diacritics(corpus_path: Path, epochs: int = 5):
 
     word_acc = word_correct / max(word_total, 1) * 100
     sent_acc = sent_exact / max(sent_total, 1) * 100
-    console.log(f"Word-level accuracy: [bold cyan]{word_acc:.2f}%[/bold cyan]")
-    console.log(f"Sentence exact match: [bold cyan]{sent_acc:.2f}%[/bold cyan]")
+    console.print(f"  Word-level accuracy: [bold cyan]{word_acc:.2f}%[/bold cyan]")
+    console.print(f"  Sentence exact match: [bold cyan]{sent_acc:.2f}%[/bold cyan]")
 
     # Demo table
-    table = Table(title="Diacritic Restoration Demo (10 examples)", show_lines=True)
+    table = Table(title="🔤 Diacritic Restoration Demo (10 examples)", show_lines=True, border_style="blue")
     table.add_column("INPUT", style="dim", max_width=40)
     table.add_column("PREDICTED", style="cyan", max_width=40)
     table.add_column("GOLD", style="green", max_width=40)
@@ -404,10 +556,22 @@ def train_diacritics(corpus_path: Path, epochs: int = 5):
         table.add_row(inp, pred, gold, st)
     console.print(table)
 
+    console.print()
+    console.print(
+        Panel.fit(
+            f"[bold green]✅ Diacritic training complete![/bold green]\n"
+            f"[dim]Word acc: {word_acc:.2f}%  |  Sentence acc: {sent_acc:.2f}%[/dim]",
+            border_style="green",
+        )
+    )
+
 # ── CLI ───────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Vietnamese diacritic restoration")
     parser.add_argument("--corpus", type=str, default="corpus")
     parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--ckpt_dir", type=str, default=None, help="Checkpoint directory")
+    parser.add_argument("--resume", action="store_true", help="Resume from last checkpoint")
     args = parser.parse_args()
-    train_diacritics(Path(args.corpus), epochs=args.epochs)
+    ckpt_dir = Path(args.ckpt_dir) if args.ckpt_dir else None
+    train_diacritics(Path(args.corpus), epochs=args.epochs, ckpt_dir=ckpt_dir, resume=args.resume)

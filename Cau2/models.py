@@ -38,16 +38,19 @@ def _device() -> torch.device:
 
 
 # ---------------------------------------------------------------------------
-# Bahdanau Attention
+# Bahdanau Attention (vectorized — no per-timestep loop)
 # ---------------------------------------------------------------------------
 class BahdanauAttention(nn.Module):
     """
-    Additive (Bahdanau) attention.
+    Additive (Bahdanau) attention — fully vectorized.
 
-    Given a *query* ``(B, 1, D_q)`` and *keys* ``(B, T, D_k)``, compute:
-        score_t = V^T tanh(W_q · query + W_k · key_t)
-        weights = softmax(scores)           → (B, T)
-        context = sum_t weights_t · keys_t  → (B, 1, D_k)
+    Supports both single-query and multi-query modes:
+      - query (B, 1, D_q) + keys (B, T, D_k)  → single context
+      - query (B, T, D_q) + keys (B, T, D_k)  → per-timestep context (vectorized)
+
+    score_t = V^T tanh(W_q · query + W_k · key_t)
+    weights = softmax(scores)           → (B, T)
+    context = sum_t weights_t · keys_t  → (B, ?, D_k)
     """
 
     def __init__(self, query_dim: int, key_dim: int, hidden_dim: int = 256):
@@ -62,22 +65,33 @@ class BahdanauAttention(nn.Module):
         """
         Parameters
         ----------
-        query : (B, 1, D_q) or (B, D_q)
-        keys  : (B, T, D_k)
+        query : (B, T_q, D_q) — can be T_q=1 (single) or T_q=T (all timesteps)
+        keys  : (B, T_k, D_k)
 
         Returns
         -------
-        context : (B, 1, D_k)
-        weights : (B, T)
+        context : (B, T_q, D_k)
+        weights : (B, T_q, T_k)
         """
         if query.dim() == 2:
             query = query.unsqueeze(1)  # (B, 1, D_q)
 
-        # (B, 1, H) + (B, T, H) → broadcast → (B, T, H)
-        energy = torch.tanh(self.W_query(query) + self.W_key(keys))  # (B, T, H)
-        scores = self.V(energy).squeeze(-1)  # (B, T)
-        weights = F.softmax(scores, dim=-1)  # (B, T)
-        context = torch.bmm(weights.unsqueeze(1), keys)  # (B, 1, D_k)
+        # W_query(query): (B, T_q, H)  →  unsqueeze to (B, T_q, 1, H)
+        # W_key(keys):    (B, T_k, H)  →  unsqueeze to (B, 1, T_k, H)
+        # broadcast addition → (B, T_q, T_k, H)
+        q_proj = self.W_query(query).unsqueeze(2)  # (B, T_q, 1, H)
+        k_proj = self.W_key(keys).unsqueeze(1)     # (B, 1, T_k, H)
+        energy = torch.tanh(q_proj + k_proj)       # (B, T_q, T_k, H)
+
+        scores = self.V(energy).squeeze(-1)        # (B, T_q, T_k)
+        weights = F.softmax(scores, dim=-1)        # (B, T_q, T_k)
+        context = torch.bmm(
+            weights.reshape(-1, weights.size(-1)).unsqueeze(1),
+            keys.unsqueeze(1).expand(-1, query.size(1), -1, -1).reshape(-1, keys.size(1), keys.size(2)),
+        ).reshape(query.size(0), query.size(1), keys.size(2))
+        # Simpler: use einsum
+        context = torch.einsum("bqk,bkd->bqd", weights, keys)  # (B, T_q, D_k)
+
         return context, weights
 
 
@@ -131,7 +145,6 @@ class VanillaLSTM(_LMBase):
             batch_first=True,
         )
         self.dropout = nn.Dropout(0.3)
-        self.fc = nn.Linear(self.hidden_dim, vocab_size)
 
         # Weight tying — project back through embedding matrix
         # Requires matching dims, so add a projection if embed_dim != hidden_dim
@@ -185,7 +198,7 @@ class VanillaLSTM(_LMBase):
 class StackedLSTM(_LMBase):
     """
     Embedding(vocab, 512) → LSTM(512→1024, 3 layers, dropout=0.5)
-    → Linear(1024→vocab)
+    → Dropout(0.3) → Linear(1024→vocab)
 
     Weight tying via an intermediate projection 1024→512.
     """
@@ -207,6 +220,9 @@ class StackedLSTM(_LMBase):
             dropout=0.5,
             batch_first=True,
         )
+        # Output dropout (regularize final LSTM output before projection)
+        self.output_dropout = nn.Dropout(0.3)
+
         # Weight tying projection
         self.proj = nn.Linear(self.hidden_dim, embed_dim, bias=False)
         self.fc = nn.Linear(embed_dim, vocab_size, bias=False)
@@ -236,6 +252,7 @@ class StackedLSTM(_LMBase):
 
         emb = self.embedding(x)  # (B, T, E)
         out, hidden = self.lstm(emb, hidden)  # (B, T, H)
+        out = self.output_dropout(out)  # regularize output
         out = self.proj(out)  # (B, T, E)
         logits = self.fc(out)  # (B, T, V)
         return logits, hidden
@@ -248,7 +265,7 @@ class BiLSTMAttention(_LMBase):
     """
     Embedding(vocab, 512)
     → BiLSTM(512→512, 2 layers)   →  hidden = 512*2 = 1024
-    → BahdanauAttention(query=1024, keys=1024)
+    → BahdanauAttention(query=1024, keys=1024) — VECTORIZED (no loop)
     → Linear(1024→vocab)
 
     Weight tying via an intermediate projection 1024→512.
@@ -278,6 +295,8 @@ class BiLSTMAttention(_LMBase):
             key_dim=self.hidden_dim,
             hidden_dim=256,
         )
+        self.output_dropout = nn.Dropout(0.3)
+
         # Weight tying projection
         self.proj = nn.Linear(self.hidden_dim, embed_dim, bias=False)
         self.fc = nn.Linear(embed_dim, vocab_size, bias=False)
@@ -307,21 +326,15 @@ class BiLSTMAttention(_LMBase):
         if hidden is None:
             hidden = self.init_hidden(x.size(0), x.device)
 
-        B, T = x.shape
         emb = self.embedding(x)  # (B, T, E)
         lstm_out, hidden = self.lstm(emb, hidden)  # (B, T, 1024)
 
-        # For each timestep, use its own output as query against all keys
-        # This gives per-timestep attended context
-        # query: each timestep individually → loop-free via broadcasting
-        # query shape needs to be (B, 1, D) for each t, but we can vectorise:
-        contexts = []
-        for t in range(T):
-            query_t = lstm_out[:, t : t + 1, :]  # (B, 1, 1024)
-            ctx_t, _ = self.attention(query_t, lstm_out)  # (B, 1, 1024)
-            contexts.append(ctx_t)
-        context = torch.cat(contexts, dim=1)  # (B, T, 1024)
+        # ── Vectorized attention: all T queries at once ──
+        # query = lstm_out itself: (B, T, 1024), keys = lstm_out: (B, T, 1024)
+        # → context: (B, T, 1024) — each timestep attends to all timesteps
+        context, _ = self.attention(lstm_out, lstm_out)  # (B, T, 1024)
 
+        context = self.output_dropout(context)
         out = self.proj(context)  # (B, T, E)
         logits = self.fc(out)  # (B, T, V)
         return logits, hidden
@@ -366,10 +379,9 @@ if __name__ == "__main__":
         try:
             logits, hidden = model(dummy_input)
             assert logits.shape == (B, T, VOCAB), f"Bad shape: {logits.shape}"
-            status = "PASS"
+            status = "✅ PASS"
         except Exception as exc:
-            logits_shape_str = "ERROR"
-            status = f"FAIL: {exc}"
+            status = f"❌ FAIL: {exc}"
             table.add_row(name, f"{n_params:,}", "ERROR", status)
             continue
 

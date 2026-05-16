@@ -4,9 +4,16 @@ train_tokenizer.py
 Train a SentencePiece BPE tokenizer on the sharded Vietnamese corpus
 and wrap it as a HuggingFace ``PreTrainedTokenizerFast``.
 
+Features
+--------
+* Skip if tokenizer already trained (use ``--force`` to retrain)
+* Progress bars for reservoir sampling and validation
+* Rich console logging
+
 Run
 ---
     python train_tokenizer.py --corpus_path ./corpus
+    python train_tokenizer.py --corpus_path ./corpus --force   # retrain
 """
 
 from __future__ import annotations
@@ -18,13 +25,17 @@ import random
 import sys
 import tempfile
 from pathlib import Path
+from typing import List
 
 import sentencepiece as spm
 import torch
 from rich.console import Console
+from rich.panel import Panel
 from rich.table import Table
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn, MofNCompleteColumn
 from tokenizers import Tokenizer, models, trainers, pre_tokenizers, processors, decoders
 from transformers import PreTrainedTokenizerFast
+from tqdm import tqdm
 
 BASE_DIR = Path(__file__).resolve().parent
 console = Console()
@@ -55,24 +66,41 @@ def _device() -> torch.device:
 
 
 def _reservoir_sample(file_paths: list[Path], k: int, seed: int = SEED) -> list[str]:
-    """Reservoir sampling of *k* lines from multiple files."""
+    """Reservoir sampling of *k* lines from multiple files — with progress bar."""
     rng = random.Random(seed)
     reservoir: list[str] = []
     n = 0
-    for fp in file_paths:
-        with open(fp, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                n += 1
-                if len(reservoir) < k:
-                    reservoir.append(line)
-                else:
-                    j = rng.randint(0, n - 1)
-                    if j < k:
-                        reservoir[j] = line
-    console.log(f"Reservoir sampled [cyan]{len(reservoir):,}[/cyan] lines from {n:,} total")
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[bold]Reservoir sampling[/bold]"),
+        BarColumn(bar_width=40),
+        MofNCompleteColumn(),
+        TextColumn("•"),
+        TimeElapsedColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task("Files", total=len(file_paths))
+
+        for fp in file_paths:
+            with open(fp, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    n += 1
+                    if len(reservoir) < k:
+                        reservoir.append(line)
+                    else:
+                        j = rng.randint(0, n - 1)
+                        if j < k:
+                            reservoir[j] = line
+            progress.advance(task)
+
+    console.print(
+        f"  [green]✓[/green] Sampled [cyan]{len(reservoir):,}[/cyan] lines "
+        f"from [cyan]{n:,}[/cyan] total across [cyan]{len(file_paths)}[/cyan] files"
+    )
     return reservoir
 
 
@@ -80,13 +108,13 @@ def _collect_shard_paths(corpus_path: Path) -> list[Path]:
     """Collect all shard .txt files from train/."""
     train_dir = corpus_path / "train"
     if not train_dir.exists():
-        console.log(f"[red]Train directory not found: {train_dir}[/red]")
+        console.print(f"[red]❌ Train directory not found: {train_dir}[/red]")
         sys.exit(1)
     shards = sorted(train_dir.glob("shard_*.txt"))
     if not shards:
-        console.log(f"[red]No shard files in {train_dir}[/red]")
+        console.print(f"[red]❌ No shard files in {train_dir}[/red]")
         sys.exit(1)
-    console.log(f"Found [cyan]{len(shards)}[/cyan] train shards")
+    console.print(f"  Found [cyan]{len(shards)}[/cyan] train shards")
     return shards
 
 
@@ -100,11 +128,12 @@ def train_sentencepiece(lines: list[str], output_dir: Path) -> Path:
 
     # Write sampled lines to a temporary file for SP training
     tmp_file = output_dir / "_sp_train_data.txt"
+    console.print(f"  Writing [cyan]{len(lines):,}[/cyan] lines to temp file …")
     with open(tmp_file, "w", encoding="utf-8") as f:
         for line in lines:
             f.write(line + "\n")
 
-    console.log("[bold]Training SentencePiece BPE …[/bold]")
+    console.print("[bold]  Training SentencePiece BPE …[/bold] (this may take a few minutes)")
     spm.SentencePieceTrainer.train(
         input=str(tmp_file),
         model_prefix=prefix,
@@ -122,7 +151,7 @@ def train_sentencepiece(lines: list[str], output_dir: Path) -> Path:
         num_threads=os.cpu_count() or 4,
         train_extremely_large_corpus=len(lines) > 5_000_000,
     )
-    console.log(f"[green]✓ SentencePiece model saved → {prefix}.model[/green]")
+    console.print(f"  [green]✓ SentencePiece model saved → {prefix}.model[/green]")
 
     # Clean temp file
     tmp_file.unlink(missing_ok=True)
@@ -145,7 +174,6 @@ def build_hf_tokenizer(sp_model_path: Path, output_dir: Path) -> PreTrainedToken
 
     # Use BPE model with the SP vocab
     merges: list[tuple[str, str]] = []
-    # We will construct a BPE tokenizer from the sentencepiece vocab
     tokenizer_obj = Tokenizer(models.BPE(vocab=vocab, merges=merges, unk_token=UNK_TOKEN))
     tokenizer_obj.pre_tokenizer = pre_tokenizers.Metaspace(replacement="▁", add_prefix_space=True)
     tokenizer_obj.decoder = decoders.Metaspace(replacement="▁", add_prefix_space=True)
@@ -162,7 +190,7 @@ def build_hf_tokenizer(sp_model_path: Path, output_dir: Path) -> PreTrainedToken
 
     # Save pretrained
     hf_tokenizer.save_pretrained(str(output_dir))
-    console.log(f"[green]✓ HuggingFace tokenizer saved → {output_dir}[/green]")
+    console.print(f"  [green]✓ HuggingFace tokenizer saved → {output_dir}[/green]")
     return hf_tokenizer
 
 
@@ -173,11 +201,6 @@ def build_hf_tokenizer_from_sp(sp_model_path: Path, output_dir: Path) -> PreTrai
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Use the SP processor to build a tokenizer_object via tokenizers library
-    from tokenizers import SentencePieceBPETokenizer
-
-    # Alternative: use the SP model directly via transformers
-    # We'll use a simpler, more reliable approach
     sp = spm.SentencePieceProcessor()
     sp.load(str(sp_model_path))
 
@@ -186,19 +209,17 @@ def build_hf_tokenizer_from_sp(sp_model_path: Path, output_dir: Path) -> PreTrai
     for i in range(sp.get_piece_size()):
         vocab[sp.id_to_piece(i)] = i
 
-    # Build merges from SP model (extract from pieces that are not single chars)
+    # Build merges from SP model
     pieces = []
     for i in range(sp.get_piece_size()):
         piece = sp.id_to_piece(i)
         score = sp.get_score(i)
         pieces.append((piece, score, i))
 
-    # For BPE, we reconstruct merges from the vocabulary order
     merges = []
     for piece, score, idx in sorted(pieces, key=lambda x: -x[1]):
         p = piece.replace("▁", "")
         if len(p) >= 2 and not piece.startswith("<"):
-            # Try all possible splits
             for split_pos in range(1, len(piece)):
                 left = piece[:split_pos]
                 right = piece[split_pos:]
@@ -220,7 +241,7 @@ def build_hf_tokenizer_from_sp(sp_model_path: Path, output_dir: Path) -> PreTrai
     )
 
     hf_tokenizer.save_pretrained(str(output_dir))
-    console.log(f"[green]✓ HuggingFace tokenizer saved → {output_dir}[/green]")
+    console.print(f"  [green]✓ HuggingFace tokenizer saved → {output_dir}[/green]")
     return hf_tokenizer
 
 
@@ -307,8 +328,8 @@ def validate_tokenizer(
             hf_exact += 1
     hf_accuracy = hf_exact / len(sample) * 100
 
-    console.log(f"SP  roundtrip accuracy: [cyan]{sp_accuracy:.1f}%[/cyan]  ({sp_exact}/{len(sample)})")
-    console.log(f"HF  roundtrip accuracy: [cyan]{hf_accuracy:.1f}%[/cyan]  ({hf_exact}/{len(sample)})")
+    console.print(f"  SP  roundtrip accuracy: [cyan]{sp_accuracy:.1f}%[/cyan]  ({sp_exact}/{len(sample)})")
+    console.print(f"  HF  roundtrip accuracy: [cyan]{hf_accuracy:.1f}%[/cyan]  ({hf_exact}/{len(sample)})")
 
     # ---- Vietnamese diacritics test ----
     test_str = "việt nam"
@@ -317,13 +338,15 @@ def validate_tokenizer(
     assert "việt" in sp_dec.lower() and "nam" in sp_dec.lower(), (
         f"Diacritics lost during SP encode/decode: '{test_str}' → '{sp_dec}'"
     )
-    console.log(f"[green]✓ Diacritics preserved: '{test_str}' → encode → decode → '{sp_dec}'[/green]")
+    console.print(f"  [green]✓ Diacritics preserved: '{test_str}' → encode → decode → '{sp_dec}'[/green]")
 
-    # ---- OOV rate on val ----
+    # ---- OOV rate on val — with progress ----
     total_tokens_val = 0
     unk_tokens_val = 0
     tokens_per_sentence: list[int] = []
-    for line in val_lines[:5000]:
+
+    check_lines = val_lines[:5000]
+    for line in tqdm(check_lines, desc="  OOV check", leave=False):
         ids = sp_tok.encode(line, add_bos=False, add_eos=False)
         total_tokens_val += len(ids)
         unk_tokens_val += ids.count(sp_tok.unk_id)
@@ -332,9 +355,9 @@ def validate_tokenizer(
     oov_rate = unk_tokens_val / max(total_tokens_val, 1) * 100
     avg_tps = sum(tokens_per_sentence) / max(len(tokens_per_sentence), 1)
 
-    console.log(f"Vocab size: [cyan]{sp_tok.vocab_size}[/cyan]")
-    console.log(f"OOV rate (val): [cyan]{oov_rate:.3f}%[/cyan]")
-    console.log(f"Tokens/sentence avg: [cyan]{avg_tps:.1f}[/cyan]")
+    console.print(f"  Vocab size: [cyan]{sp_tok.vocab_size}[/cyan]")
+    console.print(f"  OOV rate (val): [cyan]{oov_rate:.3f}%[/cyan]")
+    console.print(f"  Tokens/sentence avg: [cyan]{avg_tps:.1f}[/cyan]")
 
     return {
         "vocab_size": sp_tok.vocab_size,
@@ -348,32 +371,75 @@ def validate_tokenizer(
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-def main(corpus_path: Path) -> None:
-    console.rule("[bold blue]Vietnamese BPE Tokenizer Training[/bold blue]")
+def main(corpus_path: Path, force: bool = False) -> None:
+    console.print()
+    console.print(
+        Panel.fit(
+            "[bold white]Vietnamese BPE Tokenizer Training[/bold white]\n"
+            f"[dim]Corpus: {corpus_path}  •  Vocab: {VOCAB_SIZE:,}[/dim]",
+            border_style="blue",
+            title="🔤 Tokenizer",
+        )
+    )
+
     device = _device()
-    console.log(f"Device: [cyan]{device}[/cyan]")
+    console.print(f"  Device: [cyan]{device}[/cyan]")
 
-    # ---- Collect shards ----
+    tokenizer_dir = BASE_DIR / "tokenizer"
+    sp_model_path = tokenizer_dir / "vi_bpe.model"
+
+    # ── Skip if already trained ──
+    if sp_model_path.exists() and not force:
+        console.print()
+        console.print(
+            Panel(
+                f"[bold yellow]⏭  Tokenizer already exists[/bold yellow]\n"
+                f"[dim]{sp_model_path}[/dim]\n"
+                f"[dim]Use --force to retrain[/dim]",
+                border_style="yellow",
+                title="Skip",
+            )
+        )
+        # Still run validation
+        console.rule("[bold cyan]Phase 3/3: Validation[/bold cyan]")
+        val_dir = corpus_path / "val"
+        val_lines: list[str] = []
+        if val_dir.exists():
+            for vf in sorted(val_dir.glob("*.txt")):
+                with open(vf, "r", encoding="utf-8") as f:
+                    val_lines.extend(line.strip() for line in f if line.strip())
+        if val_lines:
+            # Try loading HF tokenizer
+            hf_dir = tokenizer_dir / "hf_tokenizer"
+            if hf_dir.exists():
+                hf_tok = PreTrainedTokenizerFast.from_pretrained(str(hf_dir))
+                validate_tokenizer(sp_model_path, hf_tok, val_lines)
+        console.print("\n  [green]✅ Tokenizer ready[/green]")
+        return
+
+    # ── Phase 1: Collect & sample ──
+    console.print()
+    console.rule("[bold cyan]Phase 1/3: Reservoir Sampling[/bold cyan]")
     shard_paths = _collect_shard_paths(corpus_path)
-
-    # ---- Reservoir sample ----
-    console.log(f"[bold]Reservoir sampling up to {MAX_TRAIN_LINES:,} lines …[/bold]")
     sampled_lines = _reservoir_sample(shard_paths, MAX_TRAIN_LINES, seed=SEED)
 
-    # ---- Train SentencePiece ----
-    tokenizer_dir = BASE_DIR / "tokenizer"
+    # ── Phase 2: Train SentencePiece ──
+    console.print()
+    console.rule("[bold cyan]Phase 2/3: SentencePiece Training[/bold cyan]")
     sp_model_path = train_sentencepiece(sampled_lines, tokenizer_dir)
 
-    # ---- Build HuggingFace wrapper ----
+    # ── Build HuggingFace wrapper ──
+    console.print("  Building HuggingFace wrapper …")
     hf_dir = tokenizer_dir / "hf_tokenizer"
     try:
         hf_tokenizer = build_hf_tokenizer_from_sp(sp_model_path, hf_dir)
     except Exception as exc:
-        console.log(f"[yellow]Fast wrapper failed ({exc}), using basic wrapper …[/yellow]")
+        console.print(f"  [yellow]Fast wrapper failed ({exc}), using basic wrapper …[/yellow]")
         hf_tokenizer = build_hf_tokenizer(sp_model_path, hf_dir)
 
-    # ---- Validation ----
-    # Load val lines for validation
+    # ── Phase 3: Validation ──
+    console.print()
+    console.rule("[bold cyan]Phase 3/3: Validation[/bold cyan]")
     val_dir = corpus_path / "val"
     val_lines: list[str] = []
     if val_dir.exists():
@@ -381,18 +447,23 @@ def main(corpus_path: Path) -> None:
             with open(vf, "r", encoding="utf-8") as f:
                 val_lines.extend(line.strip() for line in f if line.strip())
     if not val_lines:
-        # Fallback: use a subset of sampled lines
         val_lines = sampled_lines[:5000]
 
     stats = validate_tokenizer(sp_model_path, hf_tokenizer, val_lines)
 
-    # ---- Save stats ----
+    # ── Save stats ──
     stats_path = tokenizer_dir / "tokenizer_stats.json"
     with open(stats_path, "w", encoding="utf-8") as f:
         json.dump(stats, f, indent=2, ensure_ascii=False)
-    console.log(f"[green]✓ Stats saved → {stats_path}[/green]")
+    console.print(f"  [green]✓ Stats saved → {stats_path}[/green]")
 
-    console.rule("[bold green]Done[/bold green]")
+    console.print()
+    console.print(
+        Panel.fit(
+            "[bold green]✅ Tokenizer training completed![/bold green]",
+            border_style="green",
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -401,5 +472,6 @@ def main(corpus_path: Path) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train Vietnamese BPE tokenizer")
     parser.add_argument("--corpus_path", type=str, default="corpus", help="Path to sharded corpus")
+    parser.add_argument("--force", action="store_true", help="Force retrain even if tokenizer exists")
     args = parser.parse_args()
-    main(Path(args.corpus_path))
+    main(Path(args.corpus_path), force=args.force)

@@ -4,17 +4,21 @@ train.py
 Train any model from ``MODEL_REGISTRY``, evaluate perplexity on the
 test set, and produce a comparison table with perplexity curves.
 
+Features
+--------
+* Checkpoint saves model + optimizer + scheduler state → proper resume
+* Rich console logging with phase banners
+* Per-epoch progress with ETA
+
 CLI
 ---
     python train.py --model vanilla   --corpus corpus
     python train.py --model stacked   --corpus corpus
     python train.py --model bilstm_attn --corpus corpus
     python train.py --model vanilla   --corpus corpus --resume vanilla
-
-After all 3 have been trained, run without ``--model`` to produce the
-comparison table and plot:
-
     python train.py --corpus corpus --compare
+
+Checkpoint path can be customized with ``--ckpt_dir``.
 """
 
 from __future__ import annotations
@@ -36,6 +40,7 @@ import sentencepiece as spm
 import torch
 import torch.nn as nn
 from rich.console import Console
+from rich.panel import Panel
 from rich.table import Table
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
@@ -82,10 +87,10 @@ class LMDataset(Dataset):
         self.sp = spm.SentencePieceProcessor()
         self.sp.load(str(sp_model_path))
 
-        console.log(f"Loading shards from [cyan]{shard_dir}[/cyan] …")
+        console.print(f"  Loading shards from [cyan]{shard_dir}[/cyan] …")
         all_ids: list[int] = []
         shard_files = sorted(shard_dir.glob("shard_*.txt"))
-        for sf in tqdm(shard_files, desc="Encoding shards", leave=False):
+        for sf in tqdm(shard_files, desc="  Encoding shards", leave=False):
             with open(sf, "r", encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
@@ -100,7 +105,7 @@ class LMDataset(Dataset):
                 break
 
         self.data = torch.tensor(all_ids, dtype=torch.long)
-        console.log(f"  Total tokens: [cyan]{len(self.data):,}[/cyan]")
+        console.print(f"  Total tokens: [cyan]{len(self.data):,}[/cyan]")
 
     def __len__(self) -> int:
         return max(0, len(self.data) - self.seq_len - 1)
@@ -196,25 +201,36 @@ def evaluate(
 def train_model(
     model_name: str,
     corpus_path: Path,
+    ckpt_dir: Path,
     resume: bool = False,
 ) -> dict:
     """Train a single model. Returns history dict."""
     device = _device()
-    console.rule(f"[bold blue]Training: {model_name}[/bold blue]")
-    console.log(f"Device: [cyan]{device}[/cyan]")
 
-    # ---- Paths ----
+    console.print()
+    console.print(
+        Panel.fit(
+            f"[bold white]Training: {model_name}[/bold white]\n"
+            f"[dim]Device: {device}  •  Epochs: {EPOCHS}  •  LR: {LR}[/dim]\n"
+            f"[dim]Checkpoints: {ckpt_dir}[/dim]",
+            border_style="blue",
+            title=f"🏋️ {model_name}",
+        )
+    )
+
+    # ---- Phase 1: Load data ----
+    console.print()
+    console.rule("[bold cyan]Phase 1/4: Loading Data[/bold cyan]")
+
     sp_model = BASE_DIR / "tokenizer/vi_bpe.model"
     if not sp_model.exists():
-        console.log(f"[red]Tokenizer not found at {sp_model}. Run train_tokenizer.py first.[/red]")
+        console.print(f"[red]❌ Tokenizer not found at {sp_model}. Run train_tokenizer.py first.[/red]")
         raise FileNotFoundError(sp_model)
 
-    ckpt_dir = BASE_DIR / "checkpoints"
-    ckpt_dir.mkdir(exist_ok=True)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
     log_dir = BASE_DIR / "logs"
     log_dir.mkdir(exist_ok=True)
 
-    # ---- Datasets ----
     train_ds = LMDataset(corpus_path / "train", sp_model, seq_len=SEQ_LEN)
     val_ds = LMDataset(corpus_path / "val", sp_model, seq_len=SEQ_LEN)
     test_ds = LMDataset(corpus_path / "test", sp_model, seq_len=SEQ_LEN)
@@ -223,14 +239,16 @@ def train_model(
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, drop_last=False, num_workers=0)
     test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, drop_last=False, num_workers=0)
 
-    # ---- Model ----
+    # ---- Phase 2: Build model ----
+    console.print()
+    console.rule("[bold cyan]Phase 2/4: Building Model[/bold cyan]")
+
     vocab_size = train_ds.vocab_size
     pad_id = train_ds.pad_id
     ModelClass = MODEL_REGISTRY[model_name]
     model = ModelClass(vocab_size=vocab_size).to(device)
-    console.log(f"Parameters: [cyan]{model.count_parameters():,}[/cyan]")
+    console.print(f"  Parameters: [cyan]{model.count_parameters():,}[/cyan]")
 
-    # ---- Optimizer, scheduler, criterion ----
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", patience=PATIENCE, factor=LR_FACTOR
@@ -250,19 +268,48 @@ def train_model(
 
     ckpt_path = ckpt_dir / f"{model_name}_best.pt"
     if resume and ckpt_path.exists():
-        console.log(f"[yellow]Resuming from {ckpt_path}[/yellow]")
+        console.print()
+        console.print(
+            Panel(
+                f"[bold yellow]▶  Resuming from checkpoint[/bold yellow]\n"
+                f"[dim]{ckpt_path}[/dim]",
+                border_style="yellow",
+                title="♻️ Resume",
+            )
+        )
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"])
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        # Restore scheduler state (new fix)
+        if "scheduler_state_dict" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
         start_epoch = ckpt.get("epoch", 0) + 1
         best_val_ppl = ckpt.get("best_val_ppl", float("inf"))
         history = ckpt.get("history", history)
-        console.log(f"  Resumed at epoch {start_epoch}, best val PPL = {best_val_ppl:.2f}")
+        console.print(
+            f"  Resumed at epoch [cyan]{start_epoch}[/cyan], "
+            f"best val PPL = [cyan]{best_val_ppl:.2f}[/cyan], "
+            f"LR = [cyan]{optimizer.param_groups[0]['lr']:.2e}[/cyan]"
+        )
+    elif resume:
+        console.print(f"  [yellow]⚠ Checkpoint not found at {ckpt_path} — starting fresh[/yellow]")
 
-    # ---- Training loop ----
+    # ---- Phase 3: Training ----
+    console.print()
+    console.rule("[bold cyan]Phase 3/4: Training[/bold cyan]")
+    console.print(
+        f"  Epochs: [cyan]{start_epoch + 1}→{EPOCHS}[/cyan]  |  "
+        f"Steps/epoch: [cyan]{len(train_loader)}[/cyan]  |  "
+        f"Batch: [cyan]{BATCH_SIZE}[/cyan]  |  "
+        f"Seq len: [cyan]{SEQ_LEN}[/cyan]"
+    )
+
     t0 = time.time()
     for epoch in range(start_epoch, EPOCHS):
-        console.log(f"\n[bold]Epoch {epoch + 1}/{EPOCHS}[/bold]  lr={optimizer.param_groups[0]['lr']:.2e}")
+        console.print(
+            f"\n  [bold]━━━ Epoch {epoch + 1}/{EPOCHS} ━━━[/bold]  "
+            f"lr={optimizer.param_groups[0]['lr']:.2e}"
+        )
 
         train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device)
         val_loss, val_ppl = evaluate(model, val_loader, criterion, device)
@@ -273,12 +320,12 @@ def train_model(
         history["val_loss"].append(round(val_loss, 5))
         history["val_ppl"].append(round(val_ppl, 2))
 
-        console.log(
-            f"  train_loss={train_loss:.4f}  train_ppl={train_ppl:.2f}  "
-            f"val_loss={val_loss:.4f}  val_ppl={val_ppl:.2f}"
+        console.print(
+            f"  train_loss=[cyan]{train_loss:.4f}[/cyan]  train_ppl=[cyan]{train_ppl:.2f}[/cyan]  "
+            f"val_loss=[cyan]{val_loss:.4f}[/cyan]  val_ppl=[bold cyan]{val_ppl:.2f}[/bold cyan]"
         )
 
-        # Checkpoint
+        # Checkpoint — save model + optimizer + scheduler
         if val_ppl < best_val_ppl:
             best_val_ppl = val_ppl
             torch.save(
@@ -286,26 +333,34 @@ def train_model(
                     "epoch": epoch,
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
                     "best_val_ppl": best_val_ppl,
                     "history": history,
                     "vocab_size": vocab_size,
                 },
                 ckpt_path,
             )
-            console.log(f"  [green]✓ Saved best checkpoint (val_ppl={best_val_ppl:.2f})[/green]")
+            console.print(f"  [green]💾 Saved best checkpoint (val_ppl={best_val_ppl:.2f}) → {ckpt_path}[/green]")
 
         elapsed = time.time() - t0
-        remaining = elapsed / (epoch - start_epoch + 1) * (EPOCHS - epoch - 1)
-        console.log(f"  Elapsed: {elapsed / 60:.1f} min | ETA: {remaining / 60:.1f} min")
+        done_epochs = epoch - start_epoch + 1
+        remaining = elapsed / done_epochs * (EPOCHS - epoch - 1)
+        console.print(
+            f"  ⏱  Elapsed: {elapsed / 60:.1f} min | ETA: {remaining / 60:.1f} min"
+        )
 
     total_time = time.time() - t0
 
-    # ---- Test evaluation (load best checkpoint) ----
+    # ---- Phase 4: Test evaluation ----
+    console.print()
+    console.rule("[bold cyan]Phase 4/4: Test Evaluation[/bold cyan]")
+
     if ckpt_path.exists():
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"])
+        console.print(f"  Loaded best checkpoint: {ckpt_path}")
     test_loss, test_ppl = evaluate(model, test_loader, criterion, device)
-    console.log(f"\n[bold green]Test PPL: {test_ppl:.2f}[/bold green]")
+    console.print(f"  [bold green]Test PPL: {test_ppl:.2f}[/bold green]")
 
     history["test_loss"] = round(test_loss, 5)
     history["test_ppl"] = round(test_ppl, 2)
@@ -315,7 +370,17 @@ def train_model(
     hist_path = log_dir / f"{model_name}_history.json"
     with open(hist_path, "w") as f:
         json.dump(history, f, indent=2)
-    console.log(f"[green]✓ History saved → {hist_path}[/green]")
+    console.print(f"  [green]✓ History saved → {hist_path}[/green]")
+
+    console.print()
+    console.print(
+        Panel.fit(
+            f"[bold green]✅ Training complete: {model_name}[/bold green]\n"
+            f"[dim]Best val PPL: {best_val_ppl:.2f}  |  Test PPL: {test_ppl:.2f}  |  "
+            f"Time: {total_time / 60:.1f} min[/dim]",
+            border_style="green",
+        )
+    )
 
     return history
 
@@ -323,7 +388,7 @@ def train_model(
 # ---------------------------------------------------------------------------
 # Comparison table + plot
 # ---------------------------------------------------------------------------
-def compare_models() -> None:
+def compare_models(ckpt_dir: Path) -> None:
     """Print a rich comparison table and save perplexity curve plot."""
     log_dir = BASE_DIR / "logs"
     histories: list[dict] = []
@@ -334,11 +399,11 @@ def compare_models() -> None:
                 histories.append(json.load(f))
 
     if not histories:
-        console.log("[yellow]No training histories found. Train models first.[/yellow]")
+        console.print("[yellow]No training histories found. Train models first.[/yellow]")
         return
 
     # ---- Rich table ----
-    table = Table(title="Model Comparison", show_lines=True)
+    table = Table(title="📊 Model Comparison", show_lines=True, border_style="blue")
     table.add_column("Model", style="cyan", no_wrap=True)
     table.add_column("Params", justify="right", style="green")
     table.add_column("Train PPL", justify="right", style="yellow")
@@ -379,14 +444,23 @@ def compare_models() -> None:
     plot_path = results_dir / "perplexity_curves.png"
     fig.savefig(plot_path, dpi=150)
     plt.close(fig)
-    console.log(f"[green]✓ Perplexity curves saved → {plot_path}[/green]")
+    console.print(f"[green]✓ Perplexity curves saved → {plot_path}[/green]")
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train LSTM language models")
+    parser = argparse.ArgumentParser(
+        description="Train LSTM language models",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  python train.py --model vanilla --corpus corpus\n"
+            "  python train.py --model stacked --corpus corpus --resume stacked\n"
+            "  python train.py --corpus corpus --compare\n"
+        ),
+    )
     parser.add_argument(
         "--model",
         type=str,
@@ -399,6 +473,12 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="corpus",
         help="Path to sharded corpus directory",
+    )
+    parser.add_argument(
+        "--ckpt_dir",
+        type=str,
+        default=None,
+        help="Checkpoint directory (default: Cau2/checkpoints)",
     )
     parser.add_argument(
         "--resume",
@@ -421,17 +501,18 @@ if __name__ == "__main__":
 
     args = parse_args()
     corpus_path = Path(args.corpus)
+    ckpt_dir = Path(args.ckpt_dir) if args.ckpt_dir else BASE_DIR / "checkpoints"
 
     if args.compare:
-        compare_models()
+        compare_models(ckpt_dir)
     elif args.model:
         should_resume = args.resume == args.model
-        train_model(args.model, corpus_path, resume=should_resume)
+        train_model(args.model, corpus_path, ckpt_dir, resume=should_resume)
     else:
         # Train all models sequentially then compare
         for model_name in MODEL_REGISTRY:
             try:
-                train_model(model_name, corpus_path)
+                train_model(model_name, corpus_path, ckpt_dir)
             except Exception as exc:
-                console.log(f"[red]Error training {model_name}: {exc}[/red]")
-        compare_models()
+                console.print(f"[red]Error training {model_name}: {exc}[/red]")
+        compare_models(ckpt_dir)
