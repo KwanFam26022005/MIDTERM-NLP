@@ -175,8 +175,12 @@ def build_hf_tokenizer(sp_model_path: Path, output_dir: Path) -> PreTrainedToken
     # Use BPE model with the SP vocab
     merges: list[tuple[str, str]] = []
     tokenizer_obj = Tokenizer(models.BPE(vocab=vocab, merges=merges, unk_token=UNK_TOKEN))
-    tokenizer_obj.pre_tokenizer = pre_tokenizers.Metaspace(replacement="▁", add_prefix_space=True)
-    tokenizer_obj.decoder = decoders.Metaspace(replacement="▁", add_prefix_space=True)
+    try:
+        tokenizer_obj.pre_tokenizer = pre_tokenizers.Metaspace(replacement="▁", prepend_scheme="always")
+        tokenizer_obj.decoder = decoders.Metaspace(replacement="▁", prepend_scheme="always")
+    except TypeError:
+        tokenizer_obj.pre_tokenizer = pre_tokenizers.Metaspace(replacement="▁")
+        tokenizer_obj.decoder = decoders.Metaspace(replacement="▁")
 
     # Wrap into PreTrainedTokenizerFast
     hf_tokenizer = PreTrainedTokenizerFast(
@@ -228,8 +232,12 @@ def build_hf_tokenizer_from_sp(sp_model_path: Path, output_dir: Path) -> PreTrai
                     break
 
     tok = Tokenizer(models.BPE(vocab=vocab, merges=merges, unk_token=UNK_TOKEN))
-    tok.pre_tokenizer = pre_tokenizers.Metaspace(replacement="▁", add_prefix_space=True)
-    tok.decoder = decoders.Metaspace(replacement="▁", add_prefix_space=True)
+    try:
+        tok.pre_tokenizer = pre_tokenizers.Metaspace(replacement="▁", prepend_scheme="always")
+        tok.decoder = decoders.Metaspace(replacement="▁", prepend_scheme="always")
+    except TypeError:
+        tok.pre_tokenizer = pre_tokenizers.Metaspace(replacement="▁")
+        tok.decoder = decoders.Metaspace(replacement="▁")
 
     hf_tokenizer = PreTrainedTokenizerFast(
         tokenizer_object=tok,

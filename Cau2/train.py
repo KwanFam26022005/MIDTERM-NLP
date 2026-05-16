@@ -59,10 +59,10 @@ EPOCHS = 10
 LR = 1e-3
 WEIGHT_DECAY = 1e-4
 GRAD_CLIP = 5.0
-TBPTT_INTERVAL = 128  # detach hidden every N steps
 PATIENCE = 2
 LR_FACTOR = 0.5
 SEED = 42
+MAX_TOKENS = 50_000_000  # 50M tokens default (~30 min/epoch on T4 GPU)
 
 # ---------------------------------------------------------------------------
 # Dataset
@@ -145,8 +145,8 @@ def train_one_epoch(
     for x, y in pbar:
         x, y = x.to(device), y.to(device)
 
-        # TBPTT: detach hidden every TBPTT_INTERVAL steps
-        if hidden is not None and step % TBPTT_INTERVAL == 0:
+        # Detach hidden state to prevent backpropping into previous batches
+        if hidden is not None:
             hidden = tuple(h.detach() for h in hidden)
 
         logits, hidden = model(x, hidden)  # (B, T, V)
@@ -203,6 +203,7 @@ def train_model(
     corpus_path: Path,
     ckpt_dir: Path,
     resume: bool = False,
+    max_tokens: int = MAX_TOKENS,
 ) -> dict:
     """Train a single model. Returns history dict."""
     device = _device()
@@ -231,9 +232,9 @@ def train_model(
     log_dir = BASE_DIR / "logs"
     log_dir.mkdir(exist_ok=True)
 
-    train_ds = LMDataset(corpus_path / "train", sp_model, seq_len=SEQ_LEN)
-    val_ds = LMDataset(corpus_path / "val", sp_model, seq_len=SEQ_LEN)
-    test_ds = LMDataset(corpus_path / "test", sp_model, seq_len=SEQ_LEN)
+    train_ds = LMDataset(corpus_path / "train", sp_model, seq_len=SEQ_LEN, max_tokens=max_tokens)
+    val_ds = LMDataset(corpus_path / "val", sp_model, seq_len=SEQ_LEN, max_tokens=max_tokens // 10)
+    test_ds = LMDataset(corpus_path / "test", sp_model, seq_len=SEQ_LEN, max_tokens=max_tokens // 10)
 
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, drop_last=True, num_workers=0)
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, drop_last=False, num_workers=0)
@@ -487,6 +488,12 @@ def parse_args() -> argparse.Namespace:
         help="Model name to resume training from checkpoint",
     )
     parser.add_argument(
+        "--max_tokens",
+        type=int,
+        default=MAX_TOKENS,
+        help=f"Max tokens to load for training (default: {MAX_TOKENS:,})",
+    )
+    parser.add_argument(
         "--compare",
         action="store_true",
         help="Print comparison table and plot for all trained models",
@@ -503,16 +510,18 @@ if __name__ == "__main__":
     corpus_path = Path(args.corpus)
     ckpt_dir = Path(args.ckpt_dir) if args.ckpt_dir else BASE_DIR / "checkpoints"
 
+    max_tokens = args.max_tokens
+
     if args.compare:
         compare_models(ckpt_dir)
     elif args.model:
         should_resume = args.resume == args.model
-        train_model(args.model, corpus_path, ckpt_dir, resume=should_resume)
+        train_model(args.model, corpus_path, ckpt_dir, resume=should_resume, max_tokens=max_tokens)
     else:
         # Train all models sequentially then compare
         for model_name in MODEL_REGISTRY:
             try:
-                train_model(model_name, corpus_path, ckpt_dir)
+                train_model(model_name, corpus_path, ckpt_dir, max_tokens=max_tokens)
             except Exception as exc:
                 console.print(f"[red]Error training {model_name}: {exc}[/red]")
         compare_models(ckpt_dir)
